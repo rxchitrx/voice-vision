@@ -19,6 +19,11 @@ export const getTransactions = async () => {
   return response.data;
 };
 
+export const getPaymentConfig = async () => {
+  const response = await api.get('/payment-config');
+  return response.data;
+};
+
 export const addFunds = async (amount, description) => {
   const response = await api.post('/add-funds', {
     amount: parseFloat(amount),
@@ -27,12 +32,18 @@ export const addFunds = async (amount, description) => {
   return response.data;
 };
 
-export const sendMoney = async (amount, recipientPhone, description) => {
+const createIdempotencyKey = () => {
+  const randomPart = Math.random().toString(36).slice(2);
+  return `web-${Date.now()}-${randomPart}`;
+};
+
+export const sendMoney = async (amount, merchantId, description) => {
   const response = await api.post('/send-money', {
     amount: parseFloat(amount),
-    recipientPhone: recipientPhone || '',
+    merchantId: merchantId || '',
+    idempotencyKey: createIdempotencyKey(),
+    authMethod: 'web_session',
     description: description || '',
   });
   return response.data;
 };
-

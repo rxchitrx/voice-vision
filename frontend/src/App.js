@@ -4,11 +4,12 @@ import WalletCard from './components/WalletCard';
 import TransactionHistory from './components/TransactionHistory';
 import AddFundsModal from './components/AddFundsModal';
 import SendMoneyModal from './components/SendMoneyModal';
-import { getBalance, getTransactions, addFunds, sendMoney } from './services/api';
+import { getBalance, getTransactions, getPaymentConfig, addFunds, sendMoney } from './services/api';
 
 function App() {
   const [balance, setBalance] = useState(0);
   const [transactions, setTransactions] = useState([]);
+  const [paymentConfig, setPaymentConfig] = useState(null);
   const [showAddFundsModal, setShowAddFundsModal] = useState(false);
   const [showSendMoneyModal, setShowSendMoneyModal] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -25,12 +26,14 @@ function App() {
 
   const loadData = async () => {
     try {
-      const [balanceData, transactionsData] = await Promise.all([
+      const [balanceData, transactionsData, paymentConfigData] = await Promise.all([
         getBalance(),
-        getTransactions()
+        getTransactions(),
+        getPaymentConfig()
       ]);
       setBalance(balanceData.balance);
       setTransactions(transactionsData);
+      setPaymentConfig(paymentConfigData);
     } catch (error) {
       console.error('Error loading data:', error);
     } finally {
@@ -50,9 +53,13 @@ function App() {
     }
   };
 
-  const handleSendMoney = async (amount, recipientPhone, description) => {
+  const handleSendMoney = async (amount, description) => {
     try {
-      const response = await sendMoney(amount, recipientPhone, description);
+      if (!paymentConfig?.merchantId) {
+        alert('Payment configuration is unavailable.');
+        return;
+      }
+      const response = await sendMoney(amount, paymentConfig.merchantId, description);
       setBalance(response.balance);
       await loadData();
       setShowSendMoneyModal(false);
@@ -96,6 +103,7 @@ function App() {
       {showSendMoneyModal && (
         <SendMoneyModal
           balance={balance}
+          paymentConfig={paymentConfig}
           onClose={() => setShowSendMoneyModal(false)}
           onSendMoney={handleSendMoney}
         />
@@ -105,4 +113,3 @@ function App() {
 }
 
 export default App;
-

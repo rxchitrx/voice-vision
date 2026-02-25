@@ -1,22 +1,8 @@
 import React, { useState } from 'react';
 
-const SendMoneyModal = ({ balance, onClose, onSendMoney }) => {
+const SendMoneyModal = ({ balance, paymentConfig, onClose, onSendMoney }) => {
   const [amount, setAmount] = useState('');
-  const [recipientPhone, setRecipientPhone] = useState('');
   const [description, setDescription] = useState('');
-
-  const validateIndianPhoneNumber = (phone) => {
-    // Remove spaces and dashes
-    const cleaned = phone.replace(/[\s-]/g, '');
-    
-    // Indian phone number patterns:
-    // +91 followed by 10 digits
-    // 0 followed by 10 digits
-    // Just 10 digits
-    const indianPhoneRegex = /^(\+91[6-9]\d{9}|0[6-9]\d{9}|[6-9]\d{9})$/;
-    
-    return indianPhoneRegex.test(cleaned);
-  };
 
   const handleSubmit = (e) => {
     e.preventDefault();
@@ -28,17 +14,16 @@ const SendMoneyModal = ({ balance, onClose, onSendMoney }) => {
       alert('Insufficient balance');
       return;
     }
-    if (!recipientPhone) {
-      alert('Please enter recipient phone number');
+    if (!paymentConfig?.merchantId) {
+      alert('Payment config unavailable');
       return;
     }
-    if (!validateIndianPhoneNumber(recipientPhone)) {
-      alert('Please enter a valid Indian phone number\nFormat: +91XXXXXXXXXX or 0XXXXXXXXXX or XXXXXXXXXX (10 digits)');
+    if (parseFloat(amount) > paymentConfig.maxPerTxnAmount) {
+      alert(`Amount exceeds max per transaction (₹${Number(paymentConfig.maxPerTxnAmount).toFixed(2)})`);
       return;
     }
-    onSendMoney(parseFloat(amount), recipientPhone, description);
+    onSendMoney(parseFloat(amount), description);
     setAmount('');
-    setRecipientPhone('');
     setDescription('');
   };
 
@@ -51,15 +36,8 @@ const SendMoneyModal = ({ balance, onClose, onSendMoney }) => {
         </div>
         <form onSubmit={handleSubmit}>
           <div className="form-group">
-            <label>Recipient Phone Number</label>
-            <input
-              type="tel"
-              className="form-input"
-              placeholder="+91XXXXXXXXXX or 0XXXXXXXXXX"
-              value={recipientPhone}
-              onChange={(e) => setRecipientPhone(e.target.value)}
-              required
-            />
+            <label>Trusted Merchant</label>
+            <input type="text" className="form-input" value={paymentConfig?.merchantDisplayName || 'Unavailable'} disabled />
           </div>
           <div className="form-group">
             <label>Amount</label>
@@ -71,10 +49,13 @@ const SendMoneyModal = ({ balance, onClose, onSendMoney }) => {
               onChange={(e) => setAmount(e.target.value)}
               step="0.01"
               min="0"
-              max={balance}
+              max={Math.min(balance, Number(paymentConfig?.maxPerTxnAmount || balance))}
               required
             />
             <div className="balance-info">Available balance: ₹{balance.toFixed(2)}</div>
+            {paymentConfig && (
+              <div className="balance-info">Max per transaction: ₹{Number(paymentConfig.maxPerTxnAmount).toFixed(2)}</div>
+            )}
           </div>
           <div className="form-group">
             <label>Description (Optional)</label>

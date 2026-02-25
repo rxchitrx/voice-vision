@@ -17,10 +17,11 @@ A modern web-based financial application built with React, Node.js, Express, and
 
 **Key Features:**
 - Real-time balance tracking
-- Send and receive money
+- Strict trusted-merchant QR payments
 - Transaction history
 - Telegram notifications
 - RESTful API for iOS app integration
+- MiniCPM proxy endpoint for scene/text/document reasoning
 
 **Tech Stack:** React, Node.js, Express, MongoDB
 
@@ -35,6 +36,7 @@ An iOS accessibility application designed to assist visually impaired users thro
 **Key Features:**
 - Real-time object detection
 - Text recognition (OCR)
+- MiniCPM-powered scene understanding and document parsing (via backend proxy)
 - Indian currency recognition
 - QR code scanning with wallet integration
 - Voice announcements
@@ -48,10 +50,10 @@ An iOS accessibility application designed to assist visually impaired users thro
 
 ```
 voice-vision/
-├── digital-wallet/          # React web application
-│   ├── frontend/           # React frontend
-│   ├── backend/            # Express.js backend
-│   └── README.md           # Digital Wallet documentation
+├── backend/                # Express.js backend
+├── frontend/               # React frontend
+├── digital-wallet/         # Digital Wallet documentation
+│   └── README.md
 ├── blind-navigation/        # iOS application
 │   ├── blind-navigation/   # Xcode project
 │   └── README.md           # Blind Navigation documentation
@@ -83,12 +85,12 @@ Each project has its own development environment:
 
 ```bash
 # Digital Wallet - Backend
-cd digital-wallet/backend
+cd backend
 npm install
 npm start
 
 # Digital Wallet - Frontend
-cd digital-wallet/frontend
+cd frontend
 npm install
 npm start
 
@@ -112,15 +114,15 @@ This repository showcases two different types of applications:
 
 1. The Blind Navigation app provides a QR payment mode (activated by long-press)
 2. Users scan QR codes and enter payment amounts via voice interface
-3. Face ID/Touch ID verification is required for security
-4. The iOS app calls the Digital Wallet API to process transactions
+3. A trusted merchant review step + Face ID verification is required
+4. The iOS app calls the Digital Wallet API with idempotent transaction keys
 5. The web dashboard shows all transactions made through the iOS app
 
 ### Setting Up the Integration
 
 To use both apps together:
 
-1. Start the Digital Wallet backend (`cd digital-wallet/backend && npm start`)
+1. Start the Digital Wallet backend (`cd backend && npm start`)
 2. Run the Digital Wallet frontend (optional, for web access)
 3. Update the backend URL in `blind-navigation/blind-navigation/BackendConfig.swift` if needed
 4. Run the Blind Navigation iOS app on a device or simulator

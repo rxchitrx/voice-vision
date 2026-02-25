@@ -12,9 +12,10 @@ struct Detection: Identifiable {
 final class DetectionService: ObservableObject {
     @Published var detections: [Detection] = []
     @Published var isPaused: Bool = false
+    @Published var isAvailable: Bool = false
 
-    private let model: VNCoreMLModel
-    private let request: VNCoreMLRequest
+    private let model: VNCoreMLModel?
+    private let request: VNCoreMLRequest?
     private let queue = DispatchQueue(label: "DetectionQueue")
 
     private let minConfidence: Float = 0.5 // tune 0.4–0.6
@@ -78,22 +79,30 @@ final class DetectionService: ObservableObject {
                       width: next.width, height: next.height)
     }
 
-    init?() {
+    init() {
         guard let mlModel = try? yolo11n(configuration: MLModelConfiguration()).model,
-              let visionModel = try? VNCoreMLModel(for: mlModel) else { return nil }
+              let visionModel = try? VNCoreMLModel(for: mlModel) else {
+            self.model = nil
+            self.request = nil
+            self.isAvailable = false
+            print("ERROR: DetectionService unavailable - yolo11n model could not be loaded")
+            return
+        }
 
         self.model = visionModel
-        self.request = VNCoreMLRequest(model: visionModel)
-        self.request.imageCropAndScaleOption = .scaleFill
+        let request = VNCoreMLRequest(model: visionModel)
+        request.imageCropAndScaleOption = .scaleFill
+        self.request = request
+        self.isAvailable = true
     }
 
     func process(pixelBuffer: CVPixelBuffer) {
-        guard !isPaused else { return }
+        guard !isPaused, let request = self.request else { return }
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right)
         queue.async {
             do {
-                try handler.perform([self.request])
-                guard let results = self.request.results as? [VNRecognizedObjectObservation] else { return }
+                try handler.perform([request])
+                guard let results = request.results as? [VNRecognizedObjectObservation] else { return }
 
                 // Build detections with class-specific smoothing
                 let mapped: [Detection] = results

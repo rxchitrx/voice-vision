@@ -22,8 +22,18 @@ struct BalanceResponse: Decodable {
     let balance: Double
 }
 
+struct PaymentConfigResponse: Decodable {
+    let merchantId: String
+    let merchantDisplayName: String
+    let trustedQrFingerprint: String
+    let maxPerTxnAmount: Double
+}
+
 struct SendMoneyResponse: Decodable {
     let balance: Double
+    let transactionId: String?
+    let status: String?
+    let merchantDisplayName: String?
 }
 
 final class WalletAPIService {
@@ -60,13 +70,27 @@ final class WalletAPIService {
         performRequest(request, responseType: AddFundsResponse.self, completion: completion)
     }
     
-    func sendMoney(amount: Int, recipientPhone: String, description: String, completion: @escaping (Result<SendMoneyResponse, Error>) -> Void) {
+    func getPaymentConfig(completion: @escaping (Result<PaymentConfigResponse, Error>) -> Void) {
+        let url = BackendConfig.baseURL.appendingPathComponent("payment-config")
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+
+        performRequest(request, responseType: PaymentConfigResponse.self, completion: completion)
+    }
+
+    func sendMoney(amount: Int, merchantId: String, idempotencyKey: String, authMethod: String = "face_id", description: String, completion: @escaping (Result<SendMoneyResponse, Error>) -> Void) {
         let url = BackendConfig.baseURL.appendingPathComponent("send-money")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        let payload = SendMoneyRequest(amount: amount, recipientPhone: recipientPhone, description: description)
+        let payload = SendMoneyRequest(
+            amount: amount,
+            merchantId: merchantId,
+            idempotencyKey: idempotencyKey,
+            authMethod: authMethod,
+            description: description
+        )
         do {
             request.httpBody = try JSONEncoder().encode(payload)
         } catch {
@@ -117,7 +141,9 @@ private struct AddFundsRequest: Encodable {
 
 private struct SendMoneyRequest: Encodable {
     let amount: Int
-    let recipientPhone: String
+    let merchantId: String
+    let idempotencyKey: String
+    let authMethod: String
     let description: String
 }
 

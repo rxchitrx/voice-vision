@@ -17,6 +17,9 @@ const TransactionHistory = ({ transactions }) => {
             <div className="transaction-details">
               <div><strong>{transaction.type === 'deposit' ? 'Deposit' : 'Withdrawal'}</strong></div>
               <div>{transaction.description || 'Transaction'}</div>
+              {transaction.type === 'withdrawal' && transaction.merchantDisplayName && (
+                <div style={{ fontSize: '12px', color: '#444' }}>Merchant: {transaction.merchantDisplayName}</div>
+              )}
               <div style={{ fontSize: '12px', color: '#666' }}>{formatDate(transaction.createdAt)}</div>
             </div>
             <div className="transaction-amount">

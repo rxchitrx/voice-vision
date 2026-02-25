@@ -6,29 +6,16 @@ import LocalAuthentication
 
 struct ContentView: View {
     @StateObject private var arCamera = ARCameraService()
-    @StateObject private var detector: DetectionService
+    @StateObject private var detector = DetectionService()
     @StateObject private var textRecognition = TextRecognitionService()
     @StateObject private var currencyRecognition = CurrencyRecognitionService()
     @StateObject private var qrScanService = QRScanService()
     @StateObject private var speechService = SpeechService()
+    @StateObject private var miniCPMService = MiniCPMService()
 
     // Debug/diagnostics
     @State private var lastARSessionError: String? = nil
     @State private var cameraAuthStatus: AVAuthorizationStatus = AVCaptureDevice.authorizationStatus(for: .video)
-    
-    init() {
-        // Initialize detector safely
-        print("DEBUG: Initializing DetectionService...")
-        if let detectionService = DetectionService() {
-            _detector = StateObject(wrappedValue: detectionService)
-            print("DEBUG: DetectionService initialized successfully")
-        } else {
-            print("ERROR: Failed to initialize DetectionService - ML model could not be loaded")
-            // This will crash, but with a clear error message
-            // In production, the model should always be available
-            fatalError("Failed to initialize DetectionService - ML model could not be loaded. Please ensure yolo11n.mlpackage is included in the app bundle.")
-        }
-    }
     
     // Track objects that have been announced (only reset when they leave frame)
     @State private var announcedObjects: Set<String> = []
@@ -62,27 +49,26 @@ struct ContentView: View {
     // QR payment mode
     @State private var isQRPayModeActive: Bool = false
     @State private var pendingQRPayload: QRTransferPayload? = nil
+    @State private var paymentConfig: PaymentConfigResponse? = nil
+    @State private var paymentConfigError: String? = nil
     @State private var isSendingMoney: Bool = false
     @State private var lastQRPromptTime: Date = .distantPast
     private let qrPromptCooldown: TimeInterval = 2.5
     @State private var showQRAmountPrompt: Bool = false
+    @State private var showQRReviewPrompt: Bool = false
     @State private var qrAmountInput: String = ""
+    @State private var qrPendingAmount: Int? = nil
+    @State private var pendingPaymentIdempotencyKey: String? = nil
     @State private var qrAmountError: String? = nil
     @State private var isAuthorizingPayment: Bool = false
 
-    // TODO: Replace with the actual merchant/owner phone.
-    // QR amount is entered by the user; recipient is fixed to this number.
-    private let defaultQRRecipientPhone: String = "8290883601"
+    // MiniCPM perception mode
+    @State private var miniCPMMode: MiniCPMMode = .scene
+    @State private var lastMiniCPMSpokenSummary: String? = nil
+    @State private var lastMiniCPMSpokenTime: Date = .distantPast
+    private let miniCPMSpeechCooldown: TimeInterval = 8.0
 
-    // Option A: Only allow specific QR(s) to trigger payment.
-    // TODO: Replace this with the exact decoded QR payload string.
-    // You can add multiple allowed QRs here if needed.
-    private let allowedQRRawValues: Set<String> = [
-        // QR code shown on Wikipedia's QR code article ("QR code for mobile English Wikipedia").
-        // Decodes to the mobile English Wikipedia homepage.
-        // If you replace the QR later, update this string to the new QR's decoded text.
-        "https://en.m.wikipedia.org"
-    ]
+    private let defaultPaymentDescription = "QR payment"
     
     // Whitelist of object labels that should be spoken aloud
     // Only large, important objects that blind users need to know about
@@ -199,6 +185,55 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .padding([.top, .leading], 12)
             .zIndex(2000)
+
+            VStack(alignment: .trailing, spacing: 8) {
+                HStack(spacing: 6) {
+                    Button("Scene") { miniCPMMode = .scene }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(miniCPMMode == .scene ? Color.orange.opacity(0.85) : Color.black.opacity(0.55))
+                        .foregroundColor(.white)
+                        .cornerRadius(8)
+                    Button("Read") { miniCPMMode = .read }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(miniCPMMode == .read ? Color.orange.opacity(0.85) : Color.black.opacity(0.55))
+                        .foregroundColor(.white)
+                        .cornerRadius(8)
+                    Button("Doc") { miniCPMMode = .document }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(miniCPMMode == .document ? Color.orange.opacity(0.85) : Color.black.opacity(0.55))
+                        .foregroundColor(.white)
+                        .cornerRadius(8)
+                }
+                .font(.caption)
+
+                if let merchant = paymentConfig?.merchantDisplayName {
+                    Text("Payee: \(merchant)")
+                        .font(.caption2)
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background(Color.green.opacity(0.35))
+                        .cornerRadius(8)
+                }
+
+                if let paymentConfigError {
+                    Text(paymentConfigError)
+                        .font(.caption2)
+                        .foregroundColor(.yellow)
+                        .lineLimit(3)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background(Color.black.opacity(0.6))
+                        .cornerRadius(8)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+            .padding([.top, .trailing], 12)
+            .zIndex(2000)
+
             if !isQRPayModeActive {
                 ForEach(detector.detections) { detection in
                     DetectionBox(detection: detection)
@@ -336,9 +371,53 @@ struct ContentView: View {
                 .background(Color.black.opacity(0.35))
                 .zIndex(1500)
             }
+
+            if showQRReviewPrompt, let amount = qrPendingAmount, let merchant = paymentConfig?.merchantDisplayName {
+                VStack {
+                    Spacer()
+                    VStack(spacing: 12) {
+                        Text("Confirm Payment")
+                            .font(.headline)
+                            .foregroundColor(.white)
+
+                        Text("Merchant: \(merchant)")
+                            .font(.subheadline)
+                            .foregroundColor(.white)
+
+                        Text("Amount: ₹\(amount)")
+                            .font(.title3)
+                            .foregroundColor(.white)
+
+                        HStack(spacing: 16) {
+                            Button("Cancel") {
+                                cancelQRReviewPrompt()
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(Color.gray.opacity(0.6))
+                            .cornerRadius(8)
+
+                            Button("Authorize") {
+                                authorizeAndSendPendingPayment()
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(Color.orange.opacity(0.85))
+                            .cornerRadius(8)
+                        }
+                    }
+                    .padding(16)
+                    .background(Color.black.opacity(0.9))
+                    .cornerRadius(12)
+                    .padding(.bottom, 24)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color.black.opacity(0.5))
+                .zIndex(1600)
+            }
         }
         .onTapGesture {
-            if !showQRAmountPrompt {
+            if !showQRAmountPrompt && !showQRReviewPrompt {
                 handlePrimaryConfirmationTap()
             }
         }
@@ -359,6 +438,12 @@ struct ContentView: View {
             if !isCurrencyModeActive && !isQRPayModeActive {
                 detector.process(pixelBuffer: buffer)
                 textRecognition.process(pixelBuffer: buffer)
+                miniCPMService.maybeAnalyze(
+                    pixelBuffer: buffer,
+                    mode: miniCPMMode,
+                    ocrText: textRecognition.fullTextContent,
+                    prompt: miniCPMPromptForMode(miniCPMMode)
+                )
             }
             // Always process currency recognition (it checks isActive internally)
             currencyRecognition.process(pixelBuffer: buffer)
@@ -398,6 +483,18 @@ struct ContentView: View {
         .onReceive(qrScanService.$lastPayload) { payload in
             handleQRPayload(payload)
         }
+        .onReceive(miniCPMService.$latestSceneSummary) { summary in
+            handleMiniCPMSummary(summary, mode: .scene)
+        }
+        .onReceive(miniCPMService.$latestReadSummary) { summary in
+            handleMiniCPMSummary(summary, mode: .read)
+        }
+        .onReceive(miniCPMService.$latestDocumentSummary) { summary in
+            handleMiniCPMSummary(summary, mode: .document)
+        }
+        .onReceive(miniCPMService.$lastError.compactMap { $0 }) { error in
+            lastARSessionError = error
+        }
         .onReceive(speechService.$isSpeaking) { isSpeaking in
             // Pause text and currency recognition when speech is active to avoid conflicts
             textRecognition.isPaused = isSpeaking
@@ -416,6 +513,7 @@ struct ContentView: View {
         }
         .onAppear {
             print("DEBUG: ========== ContentView appeared - starting services... ==========")
+            loadPaymentConfiguration()
             
             // Check for basic requirements first
             guard ARWorldTrackingConfiguration.isSupported else {
@@ -431,6 +529,12 @@ struct ContentView: View {
             
             print("DEBUG: Initializing speech service...")
             speechService.initialize()
+
+            if !detector.isAvailable {
+                let message = "Object detector model is unavailable. OCR and MiniCPM features can still run."
+                print("ERROR: \(message)")
+                self.lastARSessionError = message
+            }
             
             // Test speech output to verify it works
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
@@ -758,11 +862,20 @@ struct ContentView: View {
     }
 
     private func activateQRPayMode() {
+        if paymentConfig == nil {
+            loadPaymentConfiguration()
+        }
         isQRPayModeActive = true
         isCurrencyModeActive = false
 
-        // Configure QR scan behavior (QR contents are not used for amount)
-        qrScanService.allowedRawValues = allowedQRRawValues
+        // Configure strict trusted QR behavior using backend-provided fingerprint.
+        if let trustedFingerprint = paymentConfig?.trustedQrFingerprint, !trustedFingerprint.isEmpty {
+            qrScanService.allowedFingerprints = [trustedFingerprint]
+            qrScanService.allowedRawValues = []
+        } else {
+            qrScanService.allowedFingerprints = []
+            qrScanService.allowedRawValues = []
+        }
         qrScanService.activate()
 
         // Ensure currency is off
@@ -787,21 +900,32 @@ struct ContentView: View {
     isSendingMoney = false
     lastQRPromptTime = .distantPast
     showQRAmountPrompt = false
+    showQRReviewPrompt = false
     qrAmountInput = ""
+    qrPendingAmount = nil
+    pendingPaymentIdempotencyKey = nil
     qrAmountError = nil
 
         TorchService.shared.setTorch(enabled: true, level: 1.0)
-        speechService.speak(label: "Mode", phrase: "QR pay mode activated. Point camera at the QR code.")
+        if paymentConfig == nil {
+            speechService.speak(label: "Mode", phrase: "QR pay mode activated. Payment config not loaded, so payments are locked.")
+        } else {
+            speechService.speak(label: "Mode", phrase: "QR pay mode activated. Point camera at the trusted merchant QR.")
+        }
     }
 
     private func deactivateQRPayMode(announce: Bool) {
         isQRPayModeActive = false
         qrScanService.deactivate()
+        qrScanService.allowedFingerprints = []
         pendingQRPayload = nil
         isSendingMoney = false
         lastQRPromptTime = .distantPast
         showQRAmountPrompt = false
+        showQRReviewPrompt = false
         qrAmountInput = ""
+        qrPendingAmount = nil
+        pendingPaymentIdempotencyKey = nil
         qrAmountError = nil
 
         TorchService.shared.setTorch(enabled: false)
@@ -871,14 +995,24 @@ struct ContentView: View {
     private func handleQRPayload(_ payload: QRTransferPayload?) {
         guard isQRPayModeActive else { return }
         guard !isSendingMoney else { return }
+        guard let config = paymentConfig else {
+            paymentConfigError = "Payment config unavailable. Pull to refresh backend or restart app."
+            return
+        }
 
         // If QR disappears, clear pending so a new QR can be detected.
         guard let payload else {
-            if pendingQRPayload != nil && !showQRAmountPrompt {
+            if pendingQRPayload != nil && !showQRAmountPrompt && !showQRReviewPrompt {
                 DispatchQueue.main.async {
                     self.pendingQRPayload = nil
                 }
             }
+            return
+        }
+
+        guard payload.fingerprint == config.trustedQrFingerprint else {
+            qrAmountError = "Untrusted QR"
+            speechService.speak(label: "WalletError", phrase: "Untrusted QR code. Payment blocked.")
             return
         }
 
@@ -893,7 +1027,7 @@ struct ContentView: View {
             self.showQRAmountPrompt = true
             self.qrAmountInput = ""
             self.qrAmountError = nil
-            self.speechService.speak(label: "QRPrompt", phrase: "QR detected. Please enter the amount and tap confirm.")
+            self.speechService.speak(label: "QRPrompt", phrase: "Trusted QR detected for \(config.merchantDisplayName). Enter amount and tap confirm.")
         }
     }
 
@@ -902,6 +1036,11 @@ struct ContentView: View {
         guard let _ = pendingQRPayload else { return }
         guard !isSendingMoney else { return }
         guard !isAuthorizingPayment else { return }
+        guard let config = paymentConfig else {
+            qrAmountError = "Payment config unavailable"
+            speechService.speak(label: "WalletError", phrase: "Payment configuration is unavailable. Please try again.")
+            return
+        }
 
         let trimmed = qrAmountInput.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let amount = Int(trimmed), amount > 0 else {
@@ -910,33 +1049,72 @@ struct ContentView: View {
             return
         }
 
+        let maxPerTxn = Int(config.maxPerTxnAmount.rounded(.down))
+        guard amount <= maxPerTxn else {
+            qrAmountError = "Max per transaction is ₹\(maxPerTxn)"
+            speechService.speak(label: "WalletError", phrase: "Amount exceeds the transaction limit of \(maxPerTxn) rupees.")
+            return
+        }
+
         qrAmountError = nil
+        qrPendingAmount = amount
+        pendingPaymentIdempotencyKey = UUID().uuidString
+        showQRAmountPrompt = false
+        showQRReviewPrompt = true
 
-        let announce = "You are paying \(amount) rupees. Please authorize with Face ID."
+        let announce = "You are paying \(amount) rupees to \(config.merchantDisplayName). Tap authorize to continue."
         speechService.speak(label: "Wallet", phrase: announce)
+    }
 
+    private func authorizeAndSendPendingPayment() {
+        guard isQRPayModeActive else { return }
+        guard let amount = qrPendingAmount else { return }
+        guard let config = paymentConfig else { return }
+        guard let idempotencyKey = pendingPaymentIdempotencyKey else { return }
+        guard !isSendingMoney else { return }
+        guard !isAuthorizingPayment else { return }
+
+        let announce = "Authorizing payment of \(amount) rupees to \(config.merchantDisplayName) with Face ID."
+        speechService.speak(label: "Wallet", phrase: announce)
         let delay = estimateSpeechDelay(for: announce)
+
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
             self.authorizePayment { authorized in
                 guard authorized else {
                     self.speechService.speak(label: "WalletError", phrase: "Authorization failed. Payment cancelled.")
+                    self.cancelQRReviewPrompt()
                     return
                 }
 
                 self.isSendingMoney = true
-                self.speechService.speak(label: "Wallet", phrase: "Sending \(amount) rupees.")
+                self.speechService.speak(label: "Wallet", phrase: "Sending \(amount) rupees to \(config.merchantDisplayName).")
 
-                WalletAPIService.shared.sendMoney(amount: amount, recipientPhone: defaultQRRecipientPhone, description: "QR payment") { result in
+                WalletAPIService.shared.sendMoney(
+                    amount: amount,
+                    merchantId: config.merchantId,
+                    idempotencyKey: idempotencyKey,
+                    authMethod: "face_id",
+                    description: defaultPaymentDescription
+                ) { result in
                     self.isSendingMoney = false
                     switch result {
                     case .success(let response):
                         let formattedBalance = self.formatCurrencyAmount(response.balance)
                         self.pendingQRPayload = nil
+                        self.showQRReviewPrompt = false
                         self.showQRAmountPrompt = false
                         self.qrAmountInput = ""
-                        self.speechService.speak(label: "Wallet", phrase: "Payment sent. New balance \(formattedBalance) rupees.")
+                        self.qrPendingAmount = nil
+                        self.pendingPaymentIdempotencyKey = nil
+                        let payee = response.merchantDisplayName ?? config.merchantDisplayName
+                        self.speechService.speak(label: "Wallet", phrase: "Payment sent to \(payee). New balance \(formattedBalance) rupees.")
                     case .failure:
-                        self.speechService.speak(label: "WalletError", phrase: "Unable to send money. Please try again.")
+                        self.showQRReviewPrompt = false
+                        self.pendingQRPayload = nil
+                        self.qrPendingAmount = nil
+                        self.pendingPaymentIdempotencyKey = nil
+                        self.qrAmountInput = ""
+                        self.speechService.speak(label: "WalletError", phrase: "Payment failed. No money was sent. Please try again.")
                     }
                 }
             }
@@ -946,8 +1124,20 @@ struct ContentView: View {
     private func cancelQRAmountPrompt() {
         pendingQRPayload = nil
         showQRAmountPrompt = false
+        showQRReviewPrompt = false
         qrAmountInput = ""
+        qrPendingAmount = nil
+        pendingPaymentIdempotencyKey = nil
         qrAmountError = nil
+        speechService.speak(label: "QRPrompt", phrase: "Payment cancelled.")
+    }
+
+    private func cancelQRReviewPrompt() {
+        showQRReviewPrompt = false
+        qrPendingAmount = nil
+        pendingPaymentIdempotencyKey = nil
+        qrAmountInput = ""
+        pendingQRPayload = nil
         speechService.speak(label: "QRPrompt", phrase: "Payment cancelled.")
     }
 
@@ -997,6 +1187,60 @@ struct ContentView: View {
             return String(format: "%.0f", amount)
         }
         return String(format: "%.2f", amount)
+    }
+
+    private func loadPaymentConfiguration() {
+        WalletAPIService.shared.getPaymentConfig { result in
+            switch result {
+            case .success(let config):
+                self.paymentConfig = config
+                self.paymentConfigError = nil
+                if self.isQRPayModeActive {
+                    self.qrScanService.allowedFingerprints = [config.trustedQrFingerprint]
+                }
+            case .failure(let error):
+                self.paymentConfig = nil
+                self.paymentConfigError = "Payment config load failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func miniCPMPromptForMode(_ mode: MiniCPMMode) -> String {
+        switch mode {
+        case .scene:
+            return "Briefly describe the most important navigation-relevant scene details for a blind user."
+        case .read:
+            return "Read and explain the most relevant visible text clearly and briefly."
+        case .document:
+            return "Parse visible document text into concise key fields and summarize."
+        }
+    }
+
+    private func handleMiniCPMSummary(_ summary: String, mode: MiniCPMMode) {
+        let cleaned = summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return }
+        guard !isQRPayModeActive && !isCurrencyModeActive else { return }
+        guard !speechService.isSpeaking else { return }
+
+        let now = Date()
+        guard now.timeIntervalSince(lastMiniCPMSpokenTime) >= miniCPMSpeechCooldown else { return }
+        guard cleaned != lastMiniCPMSpokenSummary else { return }
+
+        if mode == miniCPMMode || mode == .scene {
+            lastMiniCPMSpokenSummary = cleaned
+            lastMiniCPMSpokenTime = now
+            speechService.speak(label: "MiniCPM", phrase: cleaned)
+
+            if mode == .document, !miniCPMService.latestStructuredFields.isEmpty {
+                let parsed = miniCPMService.latestStructuredFields
+                    .prefix(3)
+                    .map { "\($0.key) \($0.value)" }
+                    .joined(separator: ", ")
+                if !parsed.isEmpty {
+                    speechService.speak(label: "MiniCPMDoc", phrase: "Parsed fields: \(parsed)")
+                }
+            }
+        }
     }
     
     // Handle text detection - prompt user instead of auto-reading
@@ -1128,6 +1372,14 @@ struct ContentView: View {
             // Clear detected text after reading
             self.detectedText = nil
         }
+
+        // Trigger MiniCPM reasoning for richer explanation/document parsing.
+        let reasoningMode: MiniCPMMode = (miniCPMMode == .document) ? .document : .read
+        miniCPMService.analyzeText(
+            mode: reasoningMode,
+            ocrText: currentText,
+            prompt: miniCPMPromptForMode(reasoningMode)
+        )
     }
     
     // Stop text reading when user taps screen

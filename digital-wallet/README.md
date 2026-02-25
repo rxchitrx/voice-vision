@@ -6,10 +6,11 @@ A full-stack web application for managing personal finances with real-time balan
 
 - **Balance Management**: View your current wallet balance in real-time
 - **Add Funds**: Easily deposit money into your wallet
-- **Send Money**: Transfer funds to other users via phone number
+- **Strict QR Payments**: Send money only to a backend-configured trusted merchant
 - **Transaction History**: Track all your transactions with detailed records
 - **Real-time Updates**: Balance automatically refreshes every 2 seconds
 - **Telegram Notifications**: Get instant notifications for all transactions (optional)
+- **MiniCPM Proxy API**: Optional perception endpoint for scene/text/document analysis
 
 ## Tech Stack
 
@@ -37,7 +38,7 @@ A full-stack web application for managing personal finances with real-time balan
 
 ```bash
 git clone <repository-url>
-cd digital-wallet
+cd voice-vision
 ```
 
 ### 2. Install Backend Dependencies
@@ -56,6 +57,18 @@ PORT=5001
 MONGODB_URI=mongodb://localhost:27017/digital-wallet
 TELEGRAM_BOT_TOKEN=your_bot_token_here  # Optional
 TELEGRAM_CHAT_ID=your_chat_id_here      # Optional
+
+# Strict payment config (single merchant)
+PAYMENT_MERCHANT_ID=voicevision-demo-merchant
+PAYMENT_MERCHANT_NAME=VoiceVision Demo Merchant
+PAYMENT_RECIPIENT_PHONE=8290883601
+PAYMENT_TRUSTED_QR_RAW=https://en.m.wikipedia.org
+PAYMENT_MAX_PER_TXN=5000
+
+# Optional MiniCPM proxy
+MINICPM_API_URL=
+MINICPM_API_KEY=
+MINICPM_TIMEOUT_MS=15000
 ```
 
 ### 4. Install Frontend Dependencies
@@ -87,40 +100,31 @@ The application will open in your browser at `http://localhost:3000`
 
 ## API Endpoints
 
-### Wallet
-
-- `GET /api/wallet` - Get wallet balance
-- `POST /api/wallet/deposit` - Add funds to wallet
-  - Body: `{ amount: number }`
-- `POST /api/wallet/send` - Send money to phone number
-  - Body: `{ phone: string, amount: number }`
-
-### Transactions
-
+- `GET /api/balance` - Get wallet balance
+- `POST /api/add-funds` - Add funds
+  - Body: `{ amount: number, description?: string }`
+- `GET /api/payment-config` - Get strict payment configuration
+  - Returns: `merchantId`, `merchantDisplayName`, `trustedQrFingerprint`, `maxPerTxnAmount`
+- `POST /api/send-money` - Send money to trusted merchant with idempotency
+  - Body: `{ amount, merchantId, idempotencyKey, authMethod?, description? }`
 - `GET /api/transactions` - Get all transactions
+- `POST /api/perception/analyze` - MiniCPM proxy/fallback perception endpoint
+  - Body: `{ mode: "scene"|"read"|"document", prompt?, ocrText?, imageBase64? }`
 
 ## Project Structure
 
 ```
-digital-wallet/
+voice-vision/
 ├── backend/
 │   ├── models/
-│   │   ├── Transaction.js
-│   │   └── Wallet.js
 │   ├── routes/
-│   │   ├── transactionRoutes.js
-│   │   └── walletRoutes.js
-│   ├── .env.example
+│   ├── services/
 │   ├── server.js
 │   └── package.json
 ├── frontend/
 │   ├── src/
-│   │   ├── components/
-│   │   ├── App.css
-│   │   ├── App.js
-│   │   └── index.js
 │   └── package.json
-└── README.md
+└── digital-wallet/README.md
 ```
 
 ## Usage
@@ -171,9 +175,10 @@ When testing with the iOS app, ensure:
 ### API Used by iOS App
 
 The iOS app uses these endpoints:
-- `GET /api/wallet/balance` - Check current balance
-- `POST /api/wallet/add-funds` - Add money to wallet
-- `POST /api/wallet/send-money` - Send money to recipient
+- `GET /api/balance` - Check current balance
+- `GET /api/payment-config` - Load trusted merchant config + QR fingerprint
+- `POST /api/send-money` - Send money (strict merchant + idempotency)
+- `POST /api/perception/analyze` - MiniCPM scene/read/document analysis
 
 For more details, see the [Blind Navigation README](../blind-navigation/README.md)
 

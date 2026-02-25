@@ -2,10 +2,12 @@ import Foundation
 import Vision
 import AVFoundation
 import Combine
+import CryptoKit
 
 /// QR payload for wallet transfer (amount is entered by the user, not encoded in the QR).
 struct QRTransferPayload: Equatable {
     let raw: String
+    let fingerprint: String
 }
 
 final class QRScanService: ObservableObject {
@@ -16,6 +18,8 @@ final class QRScanService: ObservableObject {
     /// Optional allowlist. If non-empty, ONLY these exact QR payload strings are accepted.
     /// Useful for "Option A" where only your provided QR should trigger transfers.
     var allowedRawValues: Set<String> = []
+    /// Fingerprint allowlist used by backend-configured trusted merchant mode.
+    var allowedFingerprints: Set<String> = []
 
     private let queue = DispatchQueue(label: "QRScanQueue")
     private var lastProcessedTime: Date = .distantPast
@@ -38,12 +42,12 @@ final class QRScanService: ObservableObject {
             guard let results = request.results as? [VNBarcodeObservation], !results.isEmpty else { return }
 
             // Prefer QR first.
-            let qr = results.first(where: { $0.symbology == .QR }) ?? results[0]
+            let qr = results.first(where: { $0.symbology == .qr }) ?? results[0]
             guard let raw = qr.payloadStringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return }
 
             self.handleRawValue(raw)
         }
-        req.symbologies = [.QR]
+        req.symbologies = [.qr]
         return req
     }()
 
@@ -97,10 +101,16 @@ final class QRScanService: ObservableObject {
     }
 
     private func handleRawValue(_ raw: String) {
+        let normalized = normalize(raw)
+        let fingerprint = sha256(normalized)
+
+        if !allowedFingerprints.isEmpty && !allowedFingerprints.contains(fingerprint) {
+            return
+        }
+
         // Option A: if an allowlist is provided, reject anything not in it.
         if !allowedRawValues.isEmpty {
             // Be forgiving about whitespace/newlines.
-            let normalized = normalize(raw)
             let normalizedAllowlist = Set(allowedRawValues.map { normalize($0) })
             if !normalizedAllowlist.contains(normalized) {
                 return
@@ -112,7 +122,7 @@ final class QRScanService: ObservableObject {
             return
         }
 
-        let payload = QRTransferPayload(raw: raw)
+        let payload = QRTransferPayload(raw: raw, fingerprint: fingerprint)
 
         lastRawValue = raw
         lastEmitTime = now
@@ -132,5 +142,10 @@ final class QRScanService: ObservableObject {
             normalized = String(normalized.dropLast())
         }
         return normalized
+    }
+
+    private func sha256(_ value: String) -> String {
+        let digest = SHA256.hash(data: Data(value.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
     }
 }

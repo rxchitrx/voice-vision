@@ -8,6 +8,7 @@ An iOS accessibility application designed to assist visually impaired users thro
 
 - **Real-time Object Detection**: Uses AI to identify and announce objects in the user's environment
 - **Text Recognition**: Extracts and reads text from images using OCR
+- **MiniCPM Understanding Layer**: Scene explanation and document parsing via backend proxy
 - **Currency Recognition**: Specifically designed to recognize and identify Indian currency (Rupees)
 - **QR Code Scanning**: Scan and read QR codes for various purposes
 - **Voice Announcements**: Provides audio feedback for all detected objects and information
@@ -113,6 +114,7 @@ The app features three different modes controlled by touch gestures:
 - **Features Active**: Object detection, text recognition, obstacle detection
 - **Voice Feedback**: All detected objects and text are announced
 - **Flashlight**: Off
+- **MiniCPM Mode Selector**: `Scene`, `Read`, and `Doc` buttons in the top-right overlay
 
 ### Currency Recognition Mode
 - **Activation**: Double-tap anywhere on the screen
@@ -137,26 +139,31 @@ The Blind Navigation app integrates with the **Digital Wallet** system to enable
 ### Payment Flow
 
 1. **Activate QR Payment Mode**: Long-press the screen
-2. **Scan QR Code**: Point camera at the recipient's QR code
+2. **Scan Trusted QR Code**: Point camera at the configured merchant QR
 3. **Enter Amount**: When QR is detected, voice prompt asks for amount
-4. **Verify with Face ID**: Biometric authentication required for security
-5. **Send Money**: Amount is transferred to the hardcoded recipient
+4. **Review Step**: Confirm merchant + amount on dedicated review dialog
+5. **Verify with Face ID**: Biometric authentication required for security
+6. **Send Money**: App sends idempotent payment request to backend
 
 ### Configuration
 
-The app uses the following hardcoded values (configurable in `ContentView.swift`):
+The app fetches trusted payment config from backend (`GET /api/payment-config`):
+- `merchantId`
+- `merchantDisplayName`
+- `trustedQrFingerprint`
+- `maxPerTxnAmount`
 
-- **Default Recipient Phone**: `8290883601`
-- **Allowed QR Code**: Decodes to `https://en.m.wikipedia.org` (Wikipedia mobile QR)
-- **Backend API**:
+Backend API base URL:
   - Simulator: `http://localhost:5001/api`
   - Device: `http://192.168.29.234:5001/api` (update with your Mac's LAN IP)
 
 ### Security Features
 
 - **Face ID/Touch ID Required**: All payments require biometric verification
-- **Amount Entry**: User manually enters amount (not encoded in QR)
-- **Fixed Recipient**: Demo version sends to a single hardcoded number
+- **Two-Step Confirmation**: Explicit amount review before biometric auth
+- **Trusted QR Check**: QR fingerprint must match backend configuration
+- **Per-Transaction Limit**: Enforced client and server-side
+- **Idempotency Key**: Prevents duplicate sends on retries
 - **Voice Confirmation**: All actions are announced for accessibility
 
 ### Backend Requirements
@@ -168,11 +175,9 @@ To enable QR payments:
 
 ### Customization
 
-To customize the payment system for your use case:
-
-1. **Change Recipient**: Edit `defaultQRRecipientPhone` in `ContentView.swift`
-2. **Change QR Code**: Update `allowedQRRawValues` with your QR's decoded text
-3. **Update Backend URL**: Modify `BackendConfig.swift` with your server address
+To customize payment behavior:
+1. Update backend env vars (`PAYMENT_MERCHANT_ID`, `PAYMENT_MERCHANT_NAME`, `PAYMENT_RECIPIENT_PHONE`, `PAYMENT_TRUSTED_QR_RAW`, `PAYMENT_MAX_PER_TXN`)
+2. Update backend URL in `BackendConfig.swift` if needed
 
 ## Troubleshooting
 
