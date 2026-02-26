@@ -98,6 +98,142 @@ function buildFallbackPerceptionResponse(mode, prompt, ocrText) {
   };
 }
 
+function buildPerceptionInstruction(mode, prompt, ocrText) {
+  const normalizedMode = typeof mode === 'string' ? mode : 'scene';
+  const lines = [];
+  if (prompt && typeof prompt === 'string') {
+    lines.push(`Task: ${prompt.trim()}`);
+  }
+
+  if (normalizedMode === 'scene') {
+    lines.push('Describe the scene for a blind user in 1-2 concise sentences.');
+    lines.push('Prioritize navigation and safety-relevant details.');
+  } else if (normalizedMode === 'read') {
+    lines.push('Read and explain visible text briefly and clearly.');
+  } else {
+    lines.push('Extract key fields from visible document text.');
+    lines.push('Return concise summary plus structured fields.');
+  }
+
+  const cleanOCR = typeof ocrText === 'string' ? ocrText.trim() : '';
+  if (cleanOCR) {
+    lines.push(`OCR context:\n${cleanOCR.slice(0, 2500)}`);
+  }
+
+  lines.push('Output JSON only with keys: summary (string), structuredFields (object).');
+  return lines.join('\n\n');
+}
+
+function parseStructuredFieldsFromText(text) {
+  if (typeof text !== 'string' || !text.trim()) return {};
+
+  const fencedMatch = text.match(/```json\s*([\s\S]*?)```/i);
+  const jsonCandidate = fencedMatch ? fencedMatch[1] : text;
+  try {
+    const parsed = JSON.parse(jsonCandidate);
+    if (parsed && typeof parsed === 'object') {
+      if (parsed.structuredFields && typeof parsed.structuredFields === 'object') {
+        return parsed.structuredFields;
+      }
+      const rest = { ...parsed };
+      delete rest.summary;
+      return rest;
+    }
+  } catch (_) {
+    // Fall through to colon-line extraction.
+  }
+
+  const fields = {};
+  text.split('\n').forEach((line) => {
+    const idx = line.indexOf(':');
+    if (idx > 0 && idx < line.length - 1) {
+      const key = line.slice(0, idx).trim().replace(/^[-*\d.\s]+/, '');
+      const value = line.slice(idx + 1).trim();
+      if (key && value && key.length <= 80) {
+        fields[key] = value;
+      }
+    }
+  });
+  return fields;
+}
+
+function parseLMStudioChatResponse(data) {
+  const choice = data?.choices?.[0];
+  const content = choice?.message?.content;
+
+  if (typeof content === 'string') {
+    let summary = content.trim();
+    try {
+      const parsed = JSON.parse(summary);
+      if (parsed && typeof parsed === 'object') {
+        return {
+          summary: typeof parsed.summary === 'string' ? parsed.summary.trim() : summary,
+          structuredFields: parsed.structuredFields && typeof parsed.structuredFields === 'object'
+            ? parsed.structuredFields
+            : parseStructuredFieldsFromText(summary)
+        };
+      }
+    } catch (_) {
+      // Not strict JSON output.
+    }
+    return {
+      summary,
+      structuredFields: parseStructuredFieldsFromText(summary)
+    };
+  }
+
+  if (Array.isArray(content)) {
+    const textPart = content.find((part) => part && part.type === 'text' && typeof part.text === 'string');
+    const summary = textPart ? textPart.text.trim() : '';
+    return {
+      summary,
+      structuredFields: parseStructuredFieldsFromText(summary)
+    };
+  }
+
+  return { summary: '', structuredFields: {} };
+}
+
+async function callMiniCPMViaLMStudio({ endpoint, timeoutMs, apiKey, mode, prompt, ocrText, imageBase64 }) {
+  const model = (process.env.MINICPM_MODEL || '').trim();
+  if (!model) {
+    throw new Error('MINICPM_MODEL is required for LM Studio mode.');
+  }
+
+  const instruction = buildPerceptionInstruction(mode, prompt, ocrText);
+  const userContent = [{ type: 'text', text: instruction }];
+  if (typeof imageBase64 === 'string' && imageBase64.trim().length > 0) {
+    userContent.push({
+      type: 'image_url',
+      image_url: { url: `data:image/jpeg;base64,${imageBase64}` }
+    });
+  }
+
+  const payload = {
+    model,
+    temperature: Number(process.env.MINICPM_TEMPERATURE || 0.2),
+    max_tokens: Number(process.env.MINICPM_MAX_TOKENS || 350),
+    messages: [
+      {
+        role: 'system',
+        content: 'You are an accessibility assistant for scene understanding and document reading.'
+      },
+      {
+        role: 'user',
+        content: userContent
+      }
+    ]
+  };
+
+  const headers = { 'Content-Type': 'application/json' };
+  if (apiKey) {
+    headers.Authorization = `Bearer ${apiKey}`;
+  }
+
+  const response = await axios.post(endpoint, payload, { headers, timeout: timeoutMs });
+  return parseLMStudioChatResponse(response.data || {});
+}
+
 // Initialize wallet if it doesn't exist
 async function getOrCreateWallet() {
   let wallet = await Wallet.findOne();
@@ -293,45 +429,63 @@ router.post('/perception/analyze', async (req, res) => {
   try {
     const { mode = 'scene', prompt = '', ocrText = '', imageBase64 = '' } = req.body || {};
     const endpoint = process.env.MINICPM_API_URL;
+    const provider = (process.env.MINICPM_PROVIDER || '').trim().toLowerCase();
     const timeoutMs = Number(process.env.MINICPM_TIMEOUT_MS || 15000);
+    const apiKey = process.env.MINICPM_API_KEY;
 
     if (!endpoint) {
       return res.json(buildFallbackPerceptionResponse(mode, prompt, ocrText));
     }
 
-    const headers = { 'Content-Type': 'application/json' };
-    if (process.env.MINICPM_API_KEY) {
-      headers.Authorization = `Bearer ${process.env.MINICPM_API_KEY}`;
-    }
+    let summary = '';
+    let structuredFields = {};
+    let responseProvider = 'minicpm-proxy';
 
-    const payload = {
-      mode,
-      prompt,
-      ocrText,
-      imageBase64
-    };
-
-    const response = await axios.post(endpoint, payload, { headers, timeout: timeoutMs });
-    const data = response.data || {};
-
-    if (typeof data === 'string') {
-      return res.json({
-        provider: 'minicpm-proxy',
+    const looksLikeChatCompletions = endpoint.includes('/chat/completions');
+    if (provider === 'lmstudio' || provider === 'openai-chat' || looksLikeChatCompletions) {
+      const parsed = await callMiniCPMViaLMStudio({
+        endpoint,
+        timeoutMs,
+        apiKey,
         mode,
-        summary: data,
-        structuredFields: {}
+        prompt,
+        ocrText,
+        imageBase64
       });
+      summary = parsed.summary;
+      structuredFields = parsed.structuredFields;
+      responseProvider = 'lmstudio';
+    } else {
+      const headers = { 'Content-Type': 'application/json' };
+      if (apiKey) {
+        headers.Authorization = `Bearer ${apiKey}`;
+      }
+      const payload = {
+        mode,
+        prompt,
+        ocrText,
+        imageBase64
+      };
+      const response = await axios.post(endpoint, payload, { headers, timeout: timeoutMs });
+      const data = response.data || {};
+      if (typeof data === 'string') {
+        summary = data;
+      } else {
+        summary = typeof data.summary === 'string' ? data.summary : '';
+        structuredFields = data.structuredFields && typeof data.structuredFields === 'object'
+          ? data.structuredFields
+          : {};
+      }
     }
 
     const fallback = buildFallbackPerceptionResponse(mode, prompt, ocrText);
     res.json({
-      provider: 'minicpm-proxy',
+      provider: responseProvider,
       mode,
-      summary: typeof data.summary === 'string' && data.summary.trim().length > 0 ? data.summary : fallback.summary,
-      structuredFields: data.structuredFields && typeof data.structuredFields === 'object'
-        ? data.structuredFields
-        : fallback.structuredFields,
-      raw: data
+      summary: summary && summary.trim().length > 0 ? summary : fallback.summary,
+      structuredFields: structuredFields && Object.keys(structuredFields).length > 0
+        ? structuredFields
+        : fallback.structuredFields
     });
   } catch (error) {
     const fallback = buildFallbackPerceptionResponse(req.body?.mode, req.body?.prompt, req.body?.ocrText);

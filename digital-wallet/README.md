@@ -66,9 +66,13 @@ PAYMENT_TRUSTED_QR_RAW=https://en.m.wikipedia.org
 PAYMENT_MAX_PER_TXN=5000
 
 # Optional MiniCPM proxy
-MINICPM_API_URL=
+MINICPM_API_URL=http://127.0.0.1:1234/v1/chat/completions
 MINICPM_API_KEY=
 MINICPM_TIMEOUT_MS=15000
+MINICPM_PROVIDER=lmstudio
+MINICPM_MODEL=mini-cpm-v-4
+MINICPM_TEMPERATURE=0.2
+MINICPM_MAX_TOKENS=350
 ```
 
 ### 4. Install Frontend Dependencies
@@ -110,6 +114,16 @@ The application will open in your browser at `http://localhost:3000`
 - `GET /api/transactions` - Get all transactions
 - `POST /api/perception/analyze` - MiniCPM proxy/fallback perception endpoint
   - Body: `{ mode: "scene"|"read"|"document", prompt?, ocrText?, imageBase64? }`
+
+### LM Studio Wiring (MiniCPM)
+
+1. In LM Studio, start Local Server (OpenAI-compatible).
+2. Load a MiniCPM vision model (for example MiniCPM-V-4 GGUF).
+3. Set backend env:
+   - `MINICPM_API_URL=http://127.0.0.1:1234/v1/chat/completions`
+   - `MINICPM_PROVIDER=lmstudio`
+   - `MINICPM_MODEL=<your-lmstudio-model-id>`
+4. Restart backend. iOS will call `/api/perception/analyze` and the backend will map requests to LM Studio chat format automatically.
 
 ## Project Structure
 
