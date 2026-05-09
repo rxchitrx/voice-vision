@@ -2,16 +2,24 @@
 
 An iOS accessibility application designed to assist visually impaired users through advanced computer vision, machine learning, and augmented reality technologies.
 
+> Temporary branch note: `codex/temp-no-ocr-payments` intentionally disables
+> user-facing OCR text reading and QR/online wallet payments. Navigation,
+> obstacle/object detection, AR spatial detection, speech, and currency mode
+> remain active.
+
 ## Features
 
 ### Core Functionality
 
 - **Real-time Object Detection**: Uses AI to identify and announce objects in the user's environment
-- **Text Recognition**: Extracts and reads text from images using OCR
 - **Currency Recognition**: Specifically designed to recognize and identify Indian currency (Rupees)
-- **QR Code Scanning**: Scan and read QR codes for various purposes
 - **Voice Announcements**: Provides audio feedback for all detected objects and information
 - **AR Navigation**: Augmented reality overlay for enhanced spatial awareness
+
+Disabled on this temporary branch:
+- User-facing text recognition/OCR reading
+- QR code payment scanning
+- Biometric payment authorization
 
 ### Accessibility Features
 
@@ -30,7 +38,6 @@ An iOS accessibility application designed to assist visually impaired users thro
   - Core ML - Machine learning model integration
   - AVFoundation - Camera access and media handling
   - Vision - Image analysis and text recognition
-  - LocalAuthentication - Biometric security (Face ID / Touch ID)
 
 ### Machine Learning Models
 
@@ -102,77 +109,31 @@ blind-navigation/
 
 1. **Launch the App**: Open Blind Navigation on your iOS device
 2. **Grant Permissions**: Allow camera access when prompted
-3. **Point Camera**: Aim your device at objects or text you want to identify
+3. **Point Camera**: Aim your device at objects or currency you want to identify
 4. **Listen for Feedback**: The app will announce what it detects
 
 ## Mode Switching
 
-The app features three different modes controlled by touch gestures:
+The app features two active modes controlled by touch gestures:
 
 ### Default Mode (Object Detection)
-- **Features Active**: Object detection, text recognition, obstacle detection
-- **Voice Feedback**: All detected objects and text are announced
+- **Features Active**: Object detection, obstacle detection, AR wall/doorway/window detection
+- **Voice Feedback**: Detected objects and obstacles are announced
 - **Flashlight**: Off
 
 ### Currency Recognition Mode
 - **Activation**: Double-tap anywhere on the screen
 - **Features Active**: Only Indian currency recognition
 - **Flashlight**: Automatically turns on for better visibility
-- **Disabled**: Object detection, OCR, and QR scanning
+- **Disabled**: Object detection while currency mode is active
 - **Deactivation**: Double-tap again to return to default mode
 - **Use Case**: Identify Indian Rupee notes in low-light conditions
 
-### QR Payment Mode
-- **Activation**: Long-press (hold) anywhere on the screen
-- **Features Active**: Only QR code scanning for payments
-- **Flashlight**: Automatically turns on
-- **Disabled**: Object detection, OCR, and currency recognition
-- **Deactivation**: Long-press again to return to default mode
-- **Integration**: Works with Digital Wallet backend for peer-to-peer payments
+Long-press QR payment mode is disabled on this temporary branch.
 
 ## Digital Wallet Integration
 
-The Blind Navigation app integrates with the **Digital Wallet** system to enable QR code-based payments:
-
-### Payment Flow
-
-1. **Activate QR Payment Mode**: Long-press the screen
-2. **Scan QR Code**: Point camera at the recipient's QR code
-3. **Enter Amount**: When QR is detected, voice prompt asks for amount
-4. **Verify with Face ID**: Biometric authentication required for security
-5. **Send Money**: Amount is transferred to the hardcoded recipient
-
-### Configuration
-
-The app uses the following hardcoded values (configurable in `ContentView.swift`):
-
-- **Default Recipient Phone**: `8290883601`
-- **Allowed QR Code**: Decodes to `https://en.m.wikipedia.org` (Wikipedia mobile QR)
-- **Backend API**:
-  - Simulator: `http://localhost:5001/api`
-  - Device: `http://192.168.29.234:5001/api` (update with your Mac's LAN IP)
-
-### Security Features
-
-- **Face ID/Touch ID Required**: All payments require biometric verification
-- **Amount Entry**: User manually enters amount (not encoded in QR)
-- **Fixed Recipient**: Demo version sends to a single hardcoded number
-- **Voice Confirmation**: All actions are announced for accessibility
-
-### Backend Requirements
-
-To enable QR payments:
-1. Run the Digital Wallet backend (see [Digital Wallet README](../digital-wallet/README.md))
-2. Ensure your iOS device can reach the backend (same network or update IP in `BackendConfig.swift`)
-3. Backend must be running on port 5001 (or update the port in config)
-
-### Customization
-
-To customize the payment system for your use case:
-
-1. **Change Recipient**: Edit `defaultQRRecipientPhone` in `ContentView.swift`
-2. **Change QR Code**: Update `allowedQRRawValues` with your QR's decoded text
-3. **Update Backend URL**: Modify `BackendConfig.swift` with your server address
+The Digital Wallet backend and web app remain in the repository, but this temporary iOS branch does not call the wallet API or expose QR payment UI.
 
 ## Troubleshooting
 
