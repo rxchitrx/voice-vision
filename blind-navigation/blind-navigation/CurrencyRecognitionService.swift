@@ -27,18 +27,15 @@ final class CurrencyRecognitionService: ObservableObject {
     private let logTopPredictions: Bool = true
     
     // Valid Indian currency denominations (in Rupees)
-    private let validDenominations: Set<Int> = [10, 20, 50, 100, 200, 500, 2000]
+    private let validDenominations: Set<Int> = [10, 20, 50, 100, 200, 500]
     
     // Trained Android classifier, run directly through TensorFlow Lite on iOS.
     private var currencyInterpreter: Interpreter?
     private var currencyLabels: [String] = []
     private let modelInputSize = 224
-    private let modelConfidenceThreshold: Float = 0.85
-    private let modelConfidenceMargin: Float = 0.25
+    private let modelConfidenceThreshold: Float = 0.70
     
-    // Presence checks prevent the closed-set classifier from labeling empty scenes.
     private let textRequest: VNRecognizeTextRequest
-    private let noteRectangleRequest: VNDetectRectanglesRequest
     
     private let ciContext = CIContext(options: nil)
     private let minLuminance: CGFloat = 0.08
@@ -96,14 +93,6 @@ final class CurrencyRecognitionService: ObservableObject {
         textRequest.usesLanguageCorrection = false
         textRequest.recognitionLanguages = ["en-US"]
 
-        noteRectangleRequest = VNDetectRectanglesRequest()
-        noteRectangleRequest.maximumObservations = 3
-        noteRectangleRequest.minimumAspectRatio = 0.30
-        noteRectangleRequest.maximumAspectRatio = 0.75
-        noteRectangleRequest.minimumSize = 0.15
-        noteRectangleRequest.minimumConfidence = 0.60
-        noteRectangleRequest.quadratureTolerance = 25
-        
         print("DEBUG: Currency recognition service initialized")
     }
     
@@ -163,19 +152,16 @@ final class CurrencyRecognitionService: ObservableObject {
                 var mlResult: (label: String, confidence: Float, margin: Float)?
                 var textResults: [VNRecognizedTextObservation] = []
 
-                // Establish that a note-like object is present before asking the classifier for a denomination.
-                try handler.perform([self.textRequest, self.noteRectangleRequest])
+                try handler.perform([self.textRequest])
                 if let results = self.textRequest.results {
                     textResults = results
                 }
-                let hasNoteRectangle = !(self.noteRectangleRequest.results?.isEmpty ?? true)
 
-                if hasNoteRectangle, let result = try self.classifyCurrency(pixelBuffer: pixelBuffer) {
+                if let result = try self.classifyCurrency(pixelBuffer: pixelBuffer) {
                     if self.logTopPredictions {
                         print("DEBUG: Currency TFLite top: \(result.label)=\(String(format: "%.2f", result.confidence)), margin=\(String(format: "%.2f", result.margin))")
                     }
-                    if result.confidence >= self.modelConfidenceThreshold,
-                       result.margin >= self.modelConfidenceMargin {
+                    if result.confidence >= self.modelConfidenceThreshold {
                         mlResult = result
                         print("DEBUG: Currency ML candidate: '\(result.label)' (conf: \(String(format: "%.2f", result.confidence)))")
                     }
@@ -237,7 +223,16 @@ final class CurrencyRecognitionService: ObservableObject {
                     }
                 }
                 
-                // Method 2: Use ML model result if available
+                // Method 2: Prefer a single denomination printed on the note.
+                if detectedValue == nil {
+                    let ocrValues = Set(numberObservations.map(\.value))
+                    if ocrValues.count == 1, let ocrValue = ocrValues.first {
+                        detectedValue = ocrValue
+                        print("DEBUG: Currency detected via OCR denomination: \(ocrValue) Rupees")
+                    }
+                }
+
+                // Method 3: Use ML model result if OCR could not read a denomination
                 if detectedValue == nil, let mlResult = mlResult {
                     if let mlValue = self.extractValueFromMLLabel(mlResult.label) {
                         // Color matching is a nice extra signal, but it's brittle across lighting/cameras.
@@ -247,8 +242,8 @@ final class CurrencyRecognitionService: ObservableObject {
                     }
                 }
                 
-                // Method 3: Match numbers by color if no ₹ symbol
-                if detectedValue == nil && hasNoteRectangle && !numberObservations.isEmpty {
+                // Method 4: Use any remaining OCR denomination
+                if detectedValue == nil && !numberObservations.isEmpty {
                     for (value, _) in numberObservations {
                         // If OCR found a known denomination, accept it (color match is optional).
                         detectedValue = value
