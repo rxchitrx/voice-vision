@@ -14,6 +14,79 @@ struct DetectedCurrency: Identifiable, Equatable {
     }
 }
 
+private struct CurrencyEvidenceAccumulator {
+    private struct ModelEvidence {
+        let value: Int
+        let timestamp: Date
+    }
+
+    private struct OCREvidence {
+        let value: Int
+        let timestamp: Date
+    }
+
+    private var modelEvidence: [ModelEvidence] = []
+    private var ocrEvidence: [OCREvidence] = []
+    private let modelWindow: TimeInterval = 1.5
+    private let ocrWindow: TimeInterval = 3.0
+    private let requiredConsecutiveModelMatches = 3
+
+    mutating func recordModel(value: Int, at timestamp: Date) {
+        prune(at: timestamp)
+        modelEvidence.append(ModelEvidence(value: value, timestamp: timestamp))
+    }
+
+    mutating func recordOCR(value: Int, at timestamp: Date) {
+        prune(at: timestamp)
+        ocrEvidence.append(OCREvidence(value: value, timestamp: timestamp))
+    }
+
+    mutating func confirmedValue(at timestamp: Date) -> Int? {
+        prune(at: timestamp)
+        guard let latestModelValue = modelEvidence.last?.value else { return nil }
+
+        let consecutiveMatches = modelEvidence.reversed()
+            .prefix { $0.value == latestModelValue }
+            .count
+        guard consecutiveMatches >= requiredConsecutiveModelMatches else { return nil }
+        guard ocrEvidence.contains(where: { $0.value == latestModelValue }) else { return nil }
+        return latestModelValue
+    }
+
+    mutating func reset() {
+        modelEvidence.removeAll()
+        ocrEvidence.removeAll()
+    }
+
+    #if DEBUG
+    static func assertPolicyInvariants() {
+        let start = Date(timeIntervalSinceReferenceDate: 1_000)
+
+        var matching = CurrencyEvidenceAccumulator()
+        matching.recordOCR(value: 20, at: start)
+        assert(matching.confirmedValue(at: start) == nil, "OCR must never confirm currency by itself")
+        matching.recordModel(value: 20, at: start.addingTimeInterval(0.2))
+        matching.recordModel(value: 20, at: start.addingTimeInterval(0.4))
+        matching.recordModel(value: 20, at: start.addingTimeInterval(0.6))
+        assert(matching.confirmedValue(at: start.addingTimeInterval(0.6)) == 20,
+               "Matching cross-frame ML and OCR evidence should confirm")
+
+        var mismatching = CurrencyEvidenceAccumulator()
+        mismatching.recordOCR(value: 200, at: start)
+        mismatching.recordModel(value: 20, at: start.addingTimeInterval(0.2))
+        mismatching.recordModel(value: 20, at: start.addingTimeInterval(0.4))
+        mismatching.recordModel(value: 20, at: start.addingTimeInterval(0.6))
+        assert(mismatching.confirmedValue(at: start.addingTimeInterval(0.6)) == nil,
+               "Mismatched OCR must not confirm a model prediction")
+    }
+    #endif
+
+    private mutating func prune(at timestamp: Date) {
+        modelEvidence.removeAll { timestamp.timeIntervalSince($0.timestamp) > modelWindow }
+        ocrEvidence.removeAll { timestamp.timeIntervalSince($0.timestamp) > ocrWindow }
+    }
+}
+
 final class CurrencyRecognitionService: ObservableObject {
     @Published var detectedCurrency: DetectedCurrency? = nil
     @Published var isPaused: Bool = false
@@ -27,39 +100,29 @@ final class CurrencyRecognitionService: ObservableObject {
     private let logTopPredictions: Bool = true
     
     // Valid Indian currency denominations (in Rupees)
-    private let validDenominations: Set<Int> = [10, 20, 50, 100, 200, 500, 2000]
+    private let validDenominations: Set<Int> = [10, 20, 50, 100, 200, 500]
     
     // Trained Android classifier, run directly through TensorFlow Lite on iOS.
     private var currencyInterpreter: Interpreter?
     private var currencyLabels: [String] = []
     private let modelInputSize = 224
-    private let modelConfidenceThreshold: Float = 0.85
-    private let modelConfidenceMargin: Float = 0.25
+    private let modelConfidenceThreshold: Float = 0.70
     
-    // Presence checks prevent the closed-set classifier from labeling empty scenes.
     private let textRequest: VNRecognizeTextRequest
     private let noteRectangleRequest: VNDetectRectanglesRequest
     
     private let ciContext = CIContext(options: nil)
     private let minLuminance: CGFloat = 0.08
     
-    // Consensus tracking
-    private var recentCurrencyDetections: [(value: Int, timestamp: Date)] = []
-    private let consensusWindow: TimeInterval = 0.8
-    private let requiredMatches: Int = 2
-    
-    // Indian currency note colors (approximate RGB ranges)
-    private let currencyColorRanges: [(name: String, rRange: ClosedRange<CGFloat>, gRange: ClosedRange<CGFloat>, bRange: ClosedRange<CGFloat>)] = [
-        ("10", 0.4...0.7, 0.3...0.6, 0.2...0.5),   // Brown/Orange
-        ("20", 0.5...0.8, 0.2...0.5, 0.2...0.5),   // Red/Pink
-        ("50", 0.2...0.5, 0.4...0.7, 0.2...0.5),   // Green
-        ("100", 0.2...0.5, 0.2...0.5, 0.4...0.7),  // Blue/Purple
-        ("200", 0.6...0.9, 0.5...0.8, 0.2...0.5),  // Yellow/Orange
-        ("500", 0.5...0.8, 0.4...0.7, 0.2...0.5),  // Orange/Brown
-        ("2000", 0.6...0.9, 0.3...0.6, 0.5...0.8)  // Magenta/Pink
-    ]
+    // A denomination is announced only after stable model evidence and at least
+    // one matching OCR observation, which may arrive on a different frame.
+    private var evidenceAccumulator = CurrencyEvidenceAccumulator()
     
     init() {
+        #if DEBUG
+        CurrencyEvidenceAccumulator.assertPolicyInvariants()
+        #endif
+
         do {
             guard let modelPath = Bundle.main.path(forResource: "IndianCurrency", ofType: "tflite"),
                   let labelsURL = Bundle.main.url(forResource: "currency_labels", withExtension: "txt") else {
@@ -83,8 +146,19 @@ final class CurrencyRecognitionService: ObservableObject {
                 throw CurrencyModelError.unexpectedTensorShape
             }
 
+            // Invoke the bundled model once during startup. This catches runtime/operator
+            // incompatibilities immediately instead of silently skipping every camera frame.
+            let zeroInput = Data(count: modelInputSize * modelInputSize * 3 * MemoryLayout<Float32>.size)
+            try interpreter.copy(zeroInput, toInputAt: 0)
+            try interpreter.invoke()
+            let smokeTestOutput = try interpreter.output(at: 0)
+            guard smokeTestOutput.data.count == currencyLabels.count * MemoryLayout<Float32>.size else {
+                throw CurrencyModelError.smokeTestFailed
+            }
+
             currencyInterpreter = interpreter
-            print("DEBUG: Currency TFLite model loaded with \(currencyLabels.count) labels")
+            print("DEBUG: Initialized TensorFlow Lite runtime \(Runtime.version)")
+            print("DEBUG: Currency TFLite model loaded with \(currencyLabels.count) labels; startup inference passed")
         } catch {
             currencyInterpreter = nil
             print("ERROR: Failed to load currency TFLite model: \(error)")
@@ -101,9 +175,9 @@ final class CurrencyRecognitionService: ObservableObject {
         noteRectangleRequest.minimumAspectRatio = 0.30
         noteRectangleRequest.maximumAspectRatio = 0.75
         noteRectangleRequest.minimumSize = 0.15
-        noteRectangleRequest.minimumConfidence = 0.60
-        noteRectangleRequest.quadratureTolerance = 25
-        
+        noteRectangleRequest.minimumConfidence = 0.55
+        noteRectangleRequest.quadratureTolerance = 30
+
         print("DEBUG: Currency recognition service initialized")
     }
     
@@ -148,13 +222,10 @@ final class CurrencyRecognitionService: ObservableObject {
             
             // Check brightness
             if !self.passesBrightnessGate(pixelBuffer: pixelBuffer) {
-                self.recentCurrencyDetections.removeAll()
+                self.evidenceAccumulator.reset()
                 self.updateDetectedCurrency(nil)
                 return
             }
-            
-            // Get dominant color for color matching
-            let dominantColor = self.getDominantColor(pixelBuffer: pixelBuffer)
             
             let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right, options: [:])
             
@@ -163,19 +234,23 @@ final class CurrencyRecognitionService: ObservableObject {
                 var mlResult: (label: String, confidence: Float, margin: Float)?
                 var textResults: [VNRecognizedTextObservation] = []
 
-                // Establish that a note-like object is present before asking the classifier for a denomination.
                 try handler.perform([self.textRequest, self.noteRectangleRequest])
                 if let results = self.textRequest.results {
                     textResults = results
                 }
-                let hasNoteRectangle = !(self.noteRectangleRequest.results?.isEmpty ?? true)
+                let noteRectangle = self.noteRectangleRequest.results?
+                    .max { lhs, rhs in
+                        lhs.boundingBox.width * lhs.boundingBox.height < rhs.boundingBox.width * rhs.boundingBox.height
+                    }
 
-                if hasNoteRectangle, let result = try self.classifyCurrency(pixelBuffer: pixelBuffer) {
+                if let result = try self.classifyCurrency(
+                    pixelBuffer: pixelBuffer,
+                    noteRectangle: noteRectangle
+                ) {
                     if self.logTopPredictions {
                         print("DEBUG: Currency TFLite top: \(result.label)=\(String(format: "%.2f", result.confidence)), margin=\(String(format: "%.2f", result.margin))")
                     }
-                    if result.confidence >= self.modelConfidenceThreshold,
-                       result.margin >= self.modelConfidenceMargin {
+                    if result.confidence >= self.modelConfidenceThreshold {
                         mlResult = result
                         print("DEBUG: Currency ML candidate: '\(result.label)' (conf: \(String(format: "%.2f", result.confidence)))")
                     }
@@ -206,10 +281,11 @@ final class CurrencyRecognitionService: ObservableObject {
                     }
                 }
                 
-                // Determine currency value using multiple methods
-                var detectedValue: Int? = nil
-                
-                // Method 1: Find number near ₹ symbol
+                // OCR is corroborating evidence only. It can never create a currency
+                // detection without a stable, matching model prediction.
+                var ocrValue: Int? = nil
+
+                // Prefer a denomination printed near a rupee marker.
                 if !rupeeSymbols.isEmpty && !numberObservations.isEmpty {
                     for rupeeObs in rupeeSymbols {
                         let rupeeBox = rupeeObs.boundingBox
@@ -230,54 +306,39 @@ final class CurrencyRecognitionService: ObservableObject {
                         }
                         
                         if let closest = closestNumber {
-                            detectedValue = closest.value
-                            print("DEBUG: Currency detected via ₹ symbol: \(closest.value) Rupees")
+                            ocrValue = closest.value
+                            print("DEBUG: Currency OCR evidence near ₹ symbol: \(closest.value) Rupees")
                             break
                         }
                     }
                 }
-                
-                // Method 2: Use ML model result if available
-                if detectedValue == nil, let mlResult = mlResult {
-                    if let mlValue = self.extractValueFromMLLabel(mlResult.label) {
-                        // Color matching is a nice extra signal, but it's brittle across lighting/cameras.
-                        // Prefer the ML output directly once the label parses.
-                        detectedValue = mlValue
-                        print("DEBUG: Currency detected via ML model: \(mlValue) Rupees")
+
+                // Otherwise accept OCR evidence only when the frame contains one
+                // unambiguous known denomination.
+                if ocrValue == nil {
+                    let ocrValues = Set(numberObservations.map(\.value))
+                    if ocrValues.count == 1, let singleOCRValue = ocrValues.first {
+                        ocrValue = singleOCRValue
+                        print("DEBUG: Currency OCR evidence: \(singleOCRValue) Rupees")
                     }
                 }
-                
-                // Method 3: Match numbers by color if no ₹ symbol
-                if detectedValue == nil && hasNoteRectangle && !numberObservations.isEmpty {
-                    for (value, _) in numberObservations {
-                        // If OCR found a known denomination, accept it (color match is optional).
-                        detectedValue = value
-                        print("DEBUG: Currency detected via OCR number: \(value) Rupees")
-                        break
-                    }
+
+                let evidenceTime = Date()
+                if let ocrValue {
+                    self.evidenceAccumulator.recordOCR(value: ocrValue, at: evidenceTime)
                 }
-                
-                // Process detected currency
-                if let value = detectedValue {
-                    let detectionTime = Date()
-                    if recentCurrencyDetections.last?.value != value {
-                        recentCurrencyDetections.removeAll()
-                    }
-                    self.recentCurrencyDetections.append((value: value, timestamp: detectionTime))
-                    self.pruneOldDetections(now: detectionTime)
-                    
-                    // Check consensus
-                    let matchingDetections = self.recentCurrencyDetections.filter { $0.value == value }
-                    
-                    if matchingDetections.count >= self.requiredMatches {
-                        let currency = DetectedCurrency(value: value, name: "\(value) Rupees")
-                        self.updateDetectedCurrency(currency)
-                        print("DEBUG: ✅ Currency confirmed: \(currency.name)")
-                    } else {
-                        self.updateDetectedCurrency(nil)
-                    }
+
+                if let mlResult,
+                   let mlValue = self.extractValueFromMLLabel(mlResult.label) {
+                    self.evidenceAccumulator.recordModel(value: mlValue, at: evidenceTime)
+                    print("DEBUG: Currency ML evidence: \(mlValue) Rupees")
+                }
+
+                if let confirmedValue = self.evidenceAccumulator.confirmedValue(at: evidenceTime) {
+                    let currency = DetectedCurrency(value: confirmedValue, name: "\(confirmedValue) Rupees")
+                    self.updateDetectedCurrency(currency)
+                    print("DEBUG: ✅ Currency confirmed by stable ML plus OCR: \(currency.name)")
                 } else {
-                    self.recentCurrencyDetections.removeAll()
                     self.updateDetectedCurrency(nil)
                 }
             } catch {
@@ -286,18 +347,27 @@ final class CurrencyRecognitionService: ObservableObject {
         }
     }
 
-    private func classifyCurrency(pixelBuffer: CVPixelBuffer) throws -> (label: String, confidence: Float, margin: Float)? {
+    private func classifyCurrency(
+        pixelBuffer: CVPixelBuffer,
+        noteRectangle: VNRectangleObservation?
+    ) throws -> (label: String, confidence: Float, margin: Float)? {
         guard let interpreter = currencyInterpreter else { return nil }
 
         let source = CIImage(cvPixelBuffer: pixelBuffer).oriented(.right)
-        let translated = source.transformed(by: CGAffineTransform(
-            translationX: -source.extent.minX,
-            y: -source.extent.minY
+        let cropRect = classificationCropRect(for: source.extent, noteRectangle: noteRectangle)
+        let cropped = source.cropped(to: cropRect)
+        let translated = cropped.transformed(by: CGAffineTransform(
+            translationX: -cropRect.minX,
+            y: -cropRect.minY
         ))
         let resized = translated.transformed(by: CGAffineTransform(
-            scaleX: CGFloat(modelInputSize) / source.extent.width,
-            y: CGFloat(modelInputSize) / source.extent.height
+            scaleX: CGFloat(modelInputSize) / cropRect.width,
+            y: CGFloat(modelInputSize) / cropRect.height
         ))
+
+        #if DEBUG
+        print("DEBUG: Currency classification crop: \(noteRectangle == nil ? "center square" : "detected rectangle")")
+        #endif
 
         var rgba = [UInt8](repeating: 0, count: modelInputSize * modelInputSize * 4)
         ciContext.render(
@@ -333,6 +403,38 @@ final class CurrencyRecognitionService: ObservableObject {
         }
         return (currencyLabels[best.offset], best.element, best.element - ranked[1].element)
     }
+
+    private func classificationCropRect(
+        for extent: CGRect,
+        noteRectangle: VNRectangleObservation?
+    ) -> CGRect {
+        if let normalizedBox = noteRectangle?.boundingBox {
+            let detected = CGRect(
+                x: extent.minX + normalizedBox.minX * extent.width,
+                y: extent.minY + normalizedBox.minY * extent.height,
+                width: normalizedBox.width * extent.width,
+                height: normalizedBox.height * extent.height
+            )
+            let padded = detected.insetBy(
+                dx: -detected.width * 0.08,
+                dy: -detected.height * 0.08
+            )
+            let clipped = padded.intersection(extent)
+            if !clipped.isNull, clipped.width > 1, clipped.height > 1 {
+                return clipped
+            }
+        }
+
+        // The model was trained on square images. Preserve camera-frame aspect ratio
+        // by center-cropping instead of stretching a portrait frame into a square.
+        let side = min(extent.width, extent.height)
+        return CGRect(
+            x: extent.midX - side / 2,
+            y: extent.midY - side / 2,
+            width: side,
+            height: side
+        )
+    }
     
     /// Extract currency value from ML model label
     private func extractValueFromMLLabel(_ label: String) -> Int? {
@@ -354,11 +456,6 @@ final class CurrencyRecognitionService: ObservableObject {
         return validDenominations.contains(value) ? value : nil
     }
     
-    private func pruneOldDetections(now: Date) {
-        let expiration: TimeInterval = consensusWindow
-        recentCurrencyDetections = recentCurrencyDetections.filter { now.timeIntervalSince($0.timestamp) <= expiration }
-    }
-    
     private func updateDetectedCurrency(_ currency: DetectedCurrency?) {
         DispatchQueue.main.async {
             if self.detectedCurrency != currency {
@@ -371,7 +468,9 @@ final class CurrencyRecognitionService: ObservableObject {
     func reset() {
         DispatchQueue.main.async {
             self.detectedCurrency = nil
-            self.recentCurrencyDetections.removeAll()
+        }
+        queue.async {
+            self.evidenceAccumulator.reset()
         }
     }
     
@@ -400,50 +499,10 @@ final class CurrencyRecognitionService: ObservableObject {
         return luminance >= minLuminance
     }
     
-    /// Get dominant color from image (for currency color matching)
-    private func getDominantColor(pixelBuffer: CVPixelBuffer) -> (r: CGFloat, g: CGFloat, b: CGFloat) {
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        let extent = ciImage.extent
-        
-        guard let averageFilter = CIFilter(name: "CIAreaAverage") else {
-            return (0.5, 0.5, 0.5)
-        }
-        averageFilter.setValue(ciImage, forKey: kCIInputImageKey)
-        averageFilter.setValue(CIVector(cgRect: extent), forKey: kCIInputExtentKey)
-        
-        let outputImage = averageFilter.outputImage ?? ciImage
-        var pixel = [UInt8](repeating: 0, count: 4)
-        ciContext.render(outputImage,
-                         toBitmap: &pixel,
-                         rowBytes: 4,
-                         bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
-                         format: .RGBA8,
-                         colorSpace: CGColorSpaceCreateDeviceRGB())
-        
-        return (
-            r: CGFloat(pixel[0]) / 255.0,
-            g: CGFloat(pixel[1]) / 255.0,
-            b: CGFloat(pixel[2]) / 255.0
-        )
-    }
-    
-    /// Check if detected color matches expected currency color
-    private func matchesCurrencyColor(value: Int, color: (r: CGFloat, g: CGFloat, b: CGFloat)) -> Bool {
-        guard let colorRange = currencyColorRanges.first(where: { Int($0.name) == value }) else {
-            return false
-        }
-        
-        let matchesR = colorRange.rRange.contains(color.r)
-        let matchesG = colorRange.gRange.contains(color.g)
-        let matchesB = colorRange.bRange.contains(color.b)
-        
-        // At least 2 out of 3 color channels should match
-        let matchCount = [matchesR, matchesG, matchesB].filter { $0 }.count
-        return matchCount >= 2
-    }
 }
 
 private enum CurrencyModelError: Error {
     case missingResources
     case unexpectedTensorShape
+    case smokeTestFailed
 }
