@@ -45,6 +45,9 @@ yarn-error.log*
 xcuserdata/
 *.bak
 
+# Generated document QA renders
+document_updates/render_*/
+
 # ML Models (optional - uncomment if too large)
 # *.mlmodel
 # *.mlpackage
