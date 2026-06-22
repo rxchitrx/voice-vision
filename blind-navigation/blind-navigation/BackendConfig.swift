@@ -15,7 +15,7 @@ enum BackendConfig {
         #else
         // Device must use the Mac's LAN IP address.
         // Update this if your Mac's IP changes.
-        return URL(string: "http://192.168.29.234:5001/api")!
+        return URL(string: "http://192.168.29.17:5001/api")!
         #endif
     }
 }
