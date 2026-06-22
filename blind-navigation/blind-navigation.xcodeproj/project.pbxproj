@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		A10000012F00000100000001 /* TensorFlowLite in Frameworks */ = {isa = PBXBuildFile; productRef = A10000042F00000100000001 /* TensorFlowLite */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		3C18A3012ED611DB00A5AEFE /* blind-navigation.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "blind-navigation.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -36,6 +40,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A10000012F00000100000001 /* TensorFlowLite in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -78,6 +83,7 @@
 			);
 			name = "blind-navigation";
 			packageProductDependencies = (
+				A10000042F00000100000001 /* TensorFlowLite */,
 			);
 			productName = "blind-navigation";
 			productReference = 3C18A3012ED611DB00A5AEFE /* blind-navigation.app */;
@@ -109,6 +115,9 @@
 			minimizedProjectReferenceProxies = 1;
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 3C18A3022ED611DB00A5AEFE /* Products */;
+			packageReferences = (
+				A10000032F00000100000001 /* XCLocalSwiftPackageReference "TensorFlowLitePackage" */,
+			);
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
@@ -334,6 +343,21 @@
 			name = Release;
 		};
 /* End XCBuildConfiguration section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		A10000032F00000100000001 /* XCLocalSwiftPackageReference "TensorFlowLitePackage" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = TensorFlowLitePackage;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		A10000042F00000100000001 /* TensorFlowLite */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A10000032F00000100000001 /* XCLocalSwiftPackageReference "TensorFlowLitePackage" */;
+			productName = TensorFlowLite;
+		};
+/* End XCSwiftPackageProductDependency section */
 
 /* Begin XCConfigurationList section */
 		3C18A2FC2ED611DB00A5AEFE /* Build configuration list for PBXProject "blind-navigation" */ = {

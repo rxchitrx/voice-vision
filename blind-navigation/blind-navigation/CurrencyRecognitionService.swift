@@ -2,7 +2,7 @@ import Vision
 import AVFoundation
 import Combine
 import CoreImage
-import CoreML
+import TensorFlowLite
 
 struct DetectedCurrency: Identifiable, Equatable {
     let id = UUID()
@@ -29,8 +29,11 @@ final class CurrencyRecognitionService: ObservableObject {
     // Valid Indian currency denominations (in Rupees)
     private let validDenominations: Set<Int> = [10, 20, 50, 100, 200, 500, 2000]
     
-    // ML model for currency classification
-    private let mlRequest: VNCoreMLRequest?
+    // Trained Android classifier, run directly through TensorFlow Lite on iOS.
+    private var currencyInterpreter: Interpreter?
+    private var currencyLabels: [String] = []
+    private let modelInputSize = 224
+    private let modelConfidenceThreshold: Float = 0.70
     
     // Text recognition for finding ₹ symbol and numbers
     private let textRequest: VNRecognizeTextRequest
@@ -55,43 +58,34 @@ final class CurrencyRecognitionService: ObservableObject {
     ]
     
     init() {
-        // Load IndianCurrency ML model
-        var coreMLModel: MLModel?
+        do {
+            guard let modelPath = Bundle.main.path(forResource: "IndianCurrency", ofType: "tflite"),
+                  let labelsURL = Bundle.main.url(forResource: "currency_labels", withExtension: "txt") else {
+                throw CurrencyModelError.missingResources
+            }
 
-        // NOTE: At runtime, Core ML models must be compiled (".mlmodelc") and included in the app bundle.
-        // The source ".mlmodel" file is *not* loadable from Bundle.main at runtime.
-        // Xcode compiles it to .mlmodelc during build if it's added to the app target.
-        if let modelURL = Bundle.main.url(forResource: "IndianCurrency", withExtension: "mlmodelc") {
-            do {
-                coreMLModel = try MLModel(contentsOf: modelURL)
-                print("DEBUG: Currency ML model loaded from bundle: IndianCurrency.mlmodelc")
-            } catch {
-                print("ERROR: Failed to load IndianCurrency.mlmodelc from bundle: \(error)")
+            currencyLabels = try String(contentsOf: labelsURL, encoding: .utf8)
+                .split(whereSeparator: \.isNewline)
+                .map(String.init)
+
+            var options = Interpreter.Options()
+            options.threadCount = 2
+            let interpreter = try Interpreter(modelPath: modelPath, options: options)
+            try interpreter.allocateTensors()
+
+            let input = try interpreter.input(at: 0)
+            let output = try interpreter.output(at: 0)
+            guard input.shape.dimensions == [1, modelInputSize, modelInputSize, 3],
+                  input.dataType == .float32,
+                  output.shape.dimensions == [1, currencyLabels.count] else {
+                throw CurrencyModelError.unexpectedTensorShape
             }
-        } else if let modelURL = Bundle.main.url(forResource: "IndianCurrency", withExtension: "mlpackage") {
-            // If you switch to an .mlpackage, Xcode will also compile it; loading directly is okay as a fallback.
-            do {
-                coreMLModel = try MLModel(contentsOf: modelURL)
-                print("DEBUG: Currency ML model loaded from bundle: IndianCurrency.mlpackage")
-            } catch {
-                print("ERROR: Failed to load IndianCurrency.mlpackage from bundle: \(error)")
-            }
-        } else {
-            print("ERROR: Currency model not found in bundle. Ensure IndianCurrency.mlmodel is added to the app target so Xcode produces IndianCurrency.mlmodelc.")
-        }
-        
-        // Create Vision request for ML model
-        if let coreMLModel = coreMLModel,
-           let visionModel = try? VNCoreMLModel(for: coreMLModel) {
-            let request = VNCoreMLRequest(model: visionModel)
-            // Currency notes are often long rectangles; centerCrop can cut off the important denomination region.
-            // scaleFit keeps the full frame visible to the classifier.
-            request.imageCropAndScaleOption = .scaleFit
-            mlRequest = request
-            print("DEBUG: Currency VNCoreMLRequest created successfully")
-        } else {
-            mlRequest = nil
-            print("ERROR: Currency VNCoreMLRequest could not be created (model missing or invalid)")
+
+            currencyInterpreter = interpreter
+            print("DEBUG: Currency TFLite model loaded with \(currencyLabels.count) labels")
+        } catch {
+            currencyInterpreter = nil
+            print("ERROR: Failed to load currency TFLite model: \(error)")
         }
         
         // Configure text recognition for ₹ symbol detection
@@ -125,11 +119,11 @@ final class CurrencyRecognitionService: ObservableObject {
     func process(pixelBuffer: CVPixelBuffer) {
         // Only process when active
         guard isActive && !isPaused else { return }
-        guard mlRequest != nil else {
+        guard currencyInterpreter != nil else {
             // This is the most common failure mode when the model isn't correctly included/compiled.
             // Keep it low-noise by logging once per activation window.
             #if DEBUG
-            print("DEBUG: CurrencyRecognitionService skipping frame: mlRequest is nil (model not loaded)")
+            print("DEBUG: CurrencyRecognitionService skipping frame: TFLite model is not loaded")
             #endif
             return
         }
@@ -156,7 +150,7 @@ final class CurrencyRecognitionService: ObservableObject {
             
             do {
                 // Run both ML model and text recognition in parallel
-                var mlResult: VNClassificationObservation? = nil
+                var mlResult: (label: String, confidence: Float)?
                 var textResults: [VNRecognizedTextObservation] = []
 
                 // 1) Run text recognition first (often the most reliable path for denominations)
@@ -165,20 +159,13 @@ final class CurrencyRecognitionService: ObservableObject {
                     textResults = results
                 }
                 
-                // Run ML model classification
-                if let mlRequest = self.mlRequest {
-                    try handler.perform([mlRequest])
-
-                    if let results = mlRequest.results as? [VNClassificationObservation] {
-                        if self.logTopPredictions {
-                            let top5 = results.prefix(5).map { "\($0.identifier)=\(String(format: "%.2f", $0.confidence))" }.joined(separator: ", ")
-                            print("DEBUG: Currency ML top: \(top5)")
-                        }
-                        // Lower the threshold slightly to avoid missing valid notes in real-world lighting.
-                        if let top = results.first, top.confidence >= 0.45 {
-                            mlResult = top
-                            print("DEBUG: Currency ML candidate: '\(top.identifier)' (conf: \(String(format: "%.2f", top.confidence)))")
-                        }
+                if let result = try self.classifyCurrency(pixelBuffer: pixelBuffer) {
+                    if self.logTopPredictions {
+                        print("DEBUG: Currency TFLite top: \(result.label)=\(String(format: "%.2f", result.confidence))")
+                    }
+                    if result.confidence >= self.modelConfidenceThreshold {
+                        mlResult = result
+                        print("DEBUG: Currency ML candidate: '\(result.label)' (conf: \(String(format: "%.2f", result.confidence)))")
                     }
                 }
                 
@@ -240,7 +227,7 @@ final class CurrencyRecognitionService: ObservableObject {
                 
                 // Method 2: Use ML model result if available
                 if detectedValue == nil, let mlResult = mlResult {
-                    if let mlValue = self.extractValueFromMLLabel(mlResult.identifier) {
+                    if let mlValue = self.extractValueFromMLLabel(mlResult.label) {
                         // Color matching is a nice extra signal, but it's brittle across lighting/cameras.
                         // Prefer the ML output directly once the label parses.
                         detectedValue = mlValue
@@ -284,6 +271,52 @@ final class CurrencyRecognitionService: ObservableObject {
                 print("Currency recognition error:", error)
             }
         }
+    }
+
+    private func classifyCurrency(pixelBuffer: CVPixelBuffer) throws -> (label: String, confidence: Float)? {
+        guard let interpreter = currencyInterpreter else { return nil }
+
+        let source = CIImage(cvPixelBuffer: pixelBuffer).oriented(.right)
+        let translated = source.transformed(by: CGAffineTransform(
+            translationX: -source.extent.minX,
+            y: -source.extent.minY
+        ))
+        let resized = translated.transformed(by: CGAffineTransform(
+            scaleX: CGFloat(modelInputSize) / source.extent.width,
+            y: CGFloat(modelInputSize) / source.extent.height
+        ))
+
+        var rgba = [UInt8](repeating: 0, count: modelInputSize * modelInputSize * 4)
+        ciContext.render(
+            resized,
+            toBitmap: &rgba,
+            rowBytes: modelInputSize * 4,
+            bounds: CGRect(x: 0, y: 0, width: modelInputSize, height: modelInputSize),
+            format: .RGBA8,
+            colorSpace: CGColorSpaceCreateDeviceRGB()
+        )
+
+        var rgb = [Float32]()
+        rgb.reserveCapacity(modelInputSize * modelInputSize * 3)
+        for index in stride(from: 0, to: rgba.count, by: 4) {
+            rgb.append(Float32(rgba[index]))
+            rgb.append(Float32(rgba[index + 1]))
+            rgb.append(Float32(rgba[index + 2]))
+        }
+
+        let inputData = rgb.withUnsafeBufferPointer(Data.init(buffer:))
+        try interpreter.copy(inputData, toInputAt: 0)
+        try interpreter.invoke()
+
+        let output = try interpreter.output(at: 0)
+        let confidences = output.data.withUnsafeBytes {
+            Array($0.bindMemory(to: Float32.self))
+        }
+        guard let best = confidences.enumerated().max(by: { $0.element < $1.element }),
+              currencyLabels.indices.contains(best.offset) else {
+            return nil
+        }
+        return (currencyLabels[best.offset], best.element)
     }
     
     /// Extract currency value from ML model label
@@ -393,4 +426,9 @@ final class CurrencyRecognitionService: ObservableObject {
         let matchCount = [matchesR, matchesG, matchesB].filter { $0 }.count
         return matchCount >= 2
     }
+}
+
+private enum CurrencyModelError: Error {
+    case missingResources
+    case unexpectedTensorShape
 }
