@@ -3,6 +3,7 @@ import Combine
 import ARKit
 import AVFoundation
 import LocalAuthentication
+import UIKit
 
 struct ContentView: View {
     @StateObject private var arCamera = ARCameraService()
@@ -66,7 +67,9 @@ struct ContentView: View {
     @State private var miniCPMMode: MiniCPMMode = .scene
     @State private var lastMiniCPMSpokenSummary: String? = nil
     @State private var lastMiniCPMSpokenTime: Date = .distantPast
+    @State private var suppressObjectAnnouncementsUntil: Date = .distantPast
     private let miniCPMSpeechCooldown: TimeInterval = 8.0
+    private let miniCPMObjectSuppressionWindow: TimeInterval = 12.0
 
     private let defaultPaymentDescription = "QR payment"
     
@@ -188,19 +191,19 @@ struct ContentView: View {
 
             VStack(alignment: .trailing, spacing: 8) {
                 HStack(spacing: 6) {
-                    Button("Scene") { miniCPMMode = .scene }
+                    Button("Describe") { requestMiniCPMAnalysis(mode: .scene) }
                         .padding(.horizontal, 8)
                         .padding(.vertical, 5)
                         .background(miniCPMMode == .scene ? Color.orange.opacity(0.85) : Color.black.opacity(0.55))
                         .foregroundColor(.white)
                         .cornerRadius(8)
-                    Button("Read") { miniCPMMode = .read }
+                    Button("Read") { requestMiniCPMAnalysis(mode: .read) }
                         .padding(.horizontal, 8)
                         .padding(.vertical, 5)
                         .background(miniCPMMode == .read ? Color.orange.opacity(0.85) : Color.black.opacity(0.55))
                         .foregroundColor(.white)
                         .cornerRadius(8)
-                    Button("Doc") { miniCPMMode = .document }
+                    Button("Doc") { requestMiniCPMAnalysis(mode: .document) }
                         .padding(.horizontal, 8)
                         .padding(.vertical, 5)
                         .background(miniCPMMode == .document ? Color.orange.opacity(0.85) : Color.black.opacity(0.55))
@@ -416,34 +419,30 @@ struct ContentView: View {
                 .zIndex(1600)
             }
         }
-        .onTapGesture {
-            if !showQRAmountPrompt && !showQRReviewPrompt {
-                handlePrimaryConfirmationTap()
-            }
-        }
-        .highPriorityGesture(
-            TapGesture(count: 2)
-                .onEnded {
+        .overlay(
+            GlobalGestureCaptureView(
+                onSingleTap: {
+                    if !showQRAmountPrompt && !showQRReviewPrompt {
+                        handlePrimaryConfirmationTap()
+                    }
+                },
+                onOneFingerDoubleTap: {
                     handleCurrencyModeToggleGesture()
-                }
-        )
-        .simultaneousGesture(
-            LongPressGesture(minimumDuration: 1.0)
-                .onEnded { _ in
+                },
+                onTwoFingerDoubleTap: {
+                    requestMiniCPMAnalysis(mode: .scene)
+                },
+                onLongPress: {
                     handleQRModeToggleGesture()
                 }
+            )
+            .ignoresSafeArea()
         )
         .onReceive(arCamera.$latestBuffer.compactMap { $0 }) { buffer in
             // Only process detection/text when NOT in currency or QR pay mode
             if !isCurrencyModeActive && !isQRPayModeActive {
                 detector.process(pixelBuffer: buffer)
                 textRecognition.process(pixelBuffer: buffer)
-                miniCPMService.maybeAnalyze(
-                    pixelBuffer: buffer,
-                    mode: miniCPMMode,
-                    ocrText: textRecognition.fullTextContent,
-                    prompt: miniCPMPromptForMode(miniCPMMode)
-                )
             }
             // Always process currency recognition (it checks isActive internally)
             currencyRecognition.process(pixelBuffer: buffer)
@@ -675,6 +674,7 @@ struct ContentView: View {
         
         // Only announce if requested (for speakable objects)
         guard announce else { return }
+        guard !shouldSuppressObjectAnnouncements() else { return }
         
         // Announce only objects that haven't been announced yet
         for detection in validDetections {
@@ -769,6 +769,9 @@ struct ContentView: View {
     
     
     private func announceMeshObstacleIfNeeded() {
+        guard !shouldSuppressObjectAnnouncements() else {
+            return
+        }
         guard let nearestObstacle = arCamera.obstacles3D.first(where: { $0.type == .unknown }) else {
             return
         }
@@ -1208,7 +1211,7 @@ struct ContentView: View {
     private func miniCPMPromptForMode(_ mode: MiniCPMMode) -> String {
         switch mode {
         case .scene:
-            return "Briefly describe the most important navigation-relevant scene details for a blind user."
+            return "Describe only the most important navigation detail in one sentence of at most 25 words."
         case .read:
             return "Read and explain the most relevant visible text clearly and briefly."
         case .document:
@@ -1216,11 +1219,31 @@ struct ContentView: View {
         }
     }
 
+    private func requestMiniCPMAnalysis(mode: MiniCPMMode) {
+        guard !isCurrencyModeActive && !isQRPayModeActive else { return }
+        guard !miniCPMService.isProcessing else {
+            speechService.speakWithPriority(label: "MiniCPM", phrase: "Description is already processing.", priority: 1)
+            return
+        }
+        guard let buffer = arCamera.latestBuffer else {
+            speechService.speakWithPriority(label: "MiniCPM", phrase: "Camera is not ready yet.", priority: 1)
+            return
+        }
+
+        miniCPMMode = mode
+        suppressObjectAnnouncementsUntil = Date().addingTimeInterval(miniCPMObjectSuppressionWindow)
+        miniCPMService.analyze(
+            pixelBuffer: buffer,
+            mode: mode,
+            ocrText: textRecognition.fullTextContent,
+            prompt: miniCPMPromptForMode(mode)
+        )
+    }
+
     private func handleMiniCPMSummary(_ summary: String, mode: MiniCPMMode) {
         let cleaned = summary.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty else { return }
         guard !isQRPayModeActive && !isCurrencyModeActive else { return }
-        guard !speechService.isSpeaking else { return }
 
         let now = Date()
         guard now.timeIntervalSince(lastMiniCPMSpokenTime) >= miniCPMSpeechCooldown else { return }
@@ -1229,7 +1252,8 @@ struct ContentView: View {
         if mode == miniCPMMode || mode == .scene {
             lastMiniCPMSpokenSummary = cleaned
             lastMiniCPMSpokenTime = now
-            speechService.speak(label: "MiniCPM", phrase: cleaned)
+            suppressObjectAnnouncementsUntil = now.addingTimeInterval(3.0)
+            speechService.speakWithPriority(label: "MiniCPM", phrase: cleaned, priority: 2)
 
             if mode == .document, !miniCPMService.latestStructuredFields.isEmpty {
                 let parsed = miniCPMService.latestStructuredFields
@@ -1237,10 +1261,15 @@ struct ContentView: View {
                     .map { "\($0.key) \($0.value)" }
                     .joined(separator: ", ")
                 if !parsed.isEmpty {
-                    speechService.speak(label: "MiniCPMDoc", phrase: "Parsed fields: \(parsed)")
+                    speechService.speakWithPriority(label: "MiniCPMDoc", phrase: "Parsed fields: \(parsed)", priority: 2)
                 }
             }
         }
+    }
+
+    private func shouldSuppressObjectAnnouncements() -> Bool {
+        let now = Date()
+        return miniCPMService.isProcessing || now < suppressObjectAnnouncementsUntil || speechService.currentPriorityLevel >= 2
     }
     
     // Handle text detection - prompt user instead of auto-reading
@@ -1375,13 +1404,6 @@ struct ContentView: View {
             self.detectedText = nil
         }
 
-        // Trigger MiniCPM reasoning for richer explanation/document parsing.
-        let reasoningMode: MiniCPMMode = (miniCPMMode == .document) ? .document : .read
-        miniCPMService.analyzeText(
-            mode: reasoningMode,
-            ocrText: currentText,
-            prompt: miniCPMPromptForMode(reasoningMode)
-        )
     }
     
     // Stop text reading when user taps screen
@@ -1405,6 +1427,160 @@ struct ContentView: View {
                 }
             }
         }
+    }
+}
+
+private struct GlobalGestureCaptureView: UIViewRepresentable {
+    let onSingleTap: () -> Void
+    let onOneFingerDoubleTap: () -> Void
+    let onTwoFingerDoubleTap: () -> Void
+    let onLongPress: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(
+            onSingleTap: onSingleTap,
+            onOneFingerDoubleTap: onOneFingerDoubleTap,
+            onTwoFingerDoubleTap: onTwoFingerDoubleTap,
+            onLongPress: onLongPress
+        )
+    }
+
+    func makeUIView(context: Context) -> UIView {
+        WindowGestureHostView(coordinator: context.coordinator)
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {
+        context.coordinator.onSingleTap = onSingleTap
+        context.coordinator.onOneFingerDoubleTap = onOneFingerDoubleTap
+        context.coordinator.onTwoFingerDoubleTap = onTwoFingerDoubleTap
+        context.coordinator.onLongPress = onLongPress
+    }
+
+    final class Coordinator: NSObject {
+        var onSingleTap: () -> Void
+        var onOneFingerDoubleTap: () -> Void
+        var onTwoFingerDoubleTap: () -> Void
+        var onLongPress: () -> Void
+
+        init(
+            onSingleTap: @escaping () -> Void,
+            onOneFingerDoubleTap: @escaping () -> Void,
+            onTwoFingerDoubleTap: @escaping () -> Void,
+            onLongPress: @escaping () -> Void
+        ) {
+            self.onSingleTap = onSingleTap
+            self.onOneFingerDoubleTap = onOneFingerDoubleTap
+            self.onTwoFingerDoubleTap = onTwoFingerDoubleTap
+            self.onLongPress = onLongPress
+        }
+
+        @objc func handleSingleTap() {
+            onSingleTap()
+        }
+
+        @objc func handleOneFingerDoubleTap() {
+            onOneFingerDoubleTap()
+        }
+
+        @objc func handleTwoFingerDoubleTap() {
+            onTwoFingerDoubleTap()
+        }
+
+        @objc func handleLongPress(_ recognizer: UILongPressGestureRecognizer) {
+            guard recognizer.state == .began else { return }
+            onLongPress()
+        }
+    }
+}
+
+private final class WindowGestureHostView: UIView {
+    private weak var attachedWindow: UIWindow?
+    private let coordinator: GlobalGestureCaptureView.Coordinator
+    private let singleTap: UITapGestureRecognizer
+    private let oneFingerDoubleTap: UITapGestureRecognizer
+    private let twoFingerDoubleTap: UITapGestureRecognizer
+    private let longPress: UILongPressGestureRecognizer
+
+    init(coordinator: GlobalGestureCaptureView.Coordinator) {
+        self.coordinator = coordinator
+
+        singleTap = UITapGestureRecognizer(
+            target: coordinator,
+            action: #selector(GlobalGestureCaptureView.Coordinator.handleSingleTap)
+        )
+        singleTap.numberOfTapsRequired = 1
+        singleTap.numberOfTouchesRequired = 1
+        singleTap.cancelsTouchesInView = false
+
+        oneFingerDoubleTap = UITapGestureRecognizer(
+            target: coordinator,
+            action: #selector(GlobalGestureCaptureView.Coordinator.handleOneFingerDoubleTap)
+        )
+        oneFingerDoubleTap.numberOfTapsRequired = 2
+        oneFingerDoubleTap.numberOfTouchesRequired = 1
+        oneFingerDoubleTap.cancelsTouchesInView = false
+
+        twoFingerDoubleTap = UITapGestureRecognizer(
+            target: coordinator,
+            action: #selector(GlobalGestureCaptureView.Coordinator.handleTwoFingerDoubleTap)
+        )
+        twoFingerDoubleTap.numberOfTapsRequired = 2
+        twoFingerDoubleTap.numberOfTouchesRequired = 2
+        twoFingerDoubleTap.cancelsTouchesInView = false
+
+        longPress = UILongPressGestureRecognizer(
+            target: coordinator,
+            action: #selector(GlobalGestureCaptureView.Coordinator.handleLongPress(_:))
+        )
+        longPress.minimumPressDuration = 1.0
+        longPress.cancelsTouchesInView = false
+
+        super.init(frame: .zero)
+
+        isUserInteractionEnabled = false
+        backgroundColor = .clear
+        isAccessibilityElement = false
+
+        singleTap.require(toFail: oneFingerDoubleTap)
+        singleTap.require(toFail: twoFingerDoubleTap)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+
+        if let previousWindow = attachedWindow, previousWindow !== window {
+            detachRecognizers(from: previousWindow)
+        }
+
+        if let window, attachedWindow !== window {
+            attachRecognizers(to: window)
+            attachedWindow = window
+        }
+    }
+
+    deinit {
+        if let attachedWindow {
+            detachRecognizers(from: attachedWindow)
+        }
+    }
+
+    private func attachRecognizers(to window: UIWindow) {
+        window.addGestureRecognizer(singleTap)
+        window.addGestureRecognizer(oneFingerDoubleTap)
+        window.addGestureRecognizer(twoFingerDoubleTap)
+        window.addGestureRecognizer(longPress)
+    }
+
+    private func detachRecognizers(from window: UIWindow) {
+        window.removeGestureRecognizer(singleTap)
+        window.removeGestureRecognizer(oneFingerDoubleTap)
+        window.removeGestureRecognizer(twoFingerDoubleTap)
+        window.removeGestureRecognizer(longPress)
     }
 }
 

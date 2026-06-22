@@ -278,6 +278,15 @@ final class MiniCPMService: ObservableObject {
         self.session = session
     }
 
+    /// Runs exactly one user-requested analysis of the current frame.
+    func analyze(pixelBuffer: CVPixelBuffer, mode: MiniCPMMode, ocrText: String, prompt: String = "") {
+        queue.async {
+            guard !self.isSubmitting else { return }
+            let imageBase64 = self.encodeImageBase64(from: pixelBuffer)
+            self.submit(mode: mode, prompt: prompt, ocrText: ocrText, imageBase64: imageBase64)
+        }
+    }
+
     func maybeAnalyze(pixelBuffer: CVPixelBuffer, mode: MiniCPMMode, ocrText: String, prompt: String = "") {
         queue.async {
             let now = Date()

@@ -106,8 +106,9 @@ function buildPerceptionInstruction(mode, prompt, ocrText) {
   }
 
   if (normalizedMode === 'scene') {
-    lines.push('Describe the scene for a blind user in 1-2 concise sentences.');
+    lines.push('Describe the scene in exactly one concise sentence of at most 25 words.');
     lines.push('Prioritize navigation and safety-relevant details.');
+    lines.push('Do not add an introduction, conclusion, or follow-up summary.');
   } else if (normalizedMode === 'read') {
     lines.push('Read and explain visible text briefly and clearly.');
   } else {
@@ -212,7 +213,7 @@ async function callMiniCPMViaLMStudio({ endpoint, timeoutMs, apiKey, mode, promp
   const payload = {
     model,
     temperature: Number(process.env.MINICPM_TEMPERATURE || 0.2),
-    max_tokens: Number(process.env.MINICPM_MAX_TOKENS || 350),
+    max_tokens: Number(process.env.MINICPM_MAX_TOKENS || 700),
     messages: [
       {
         role: 'system',

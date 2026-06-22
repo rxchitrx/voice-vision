@@ -87,19 +87,29 @@ final class SpeechService: NSObject, ObservableObject {
 
         guard shouldSpeak else { return }
         
+        // Prevent lower-priority speech from interrupting more important speech.
+        let shouldInterruptCurrent = priorityQueue.sync { () -> Bool in
+            if synthesizer.isSpeaking && priority < currentPriority {
+                return false
+            }
+            currentPriority = priority
+            return true
+        }
+
+        guard shouldInterruptCurrent else {
+            print("DEBUG: SpeechService - lower priority speech skipped for '\(label)'")
+            return
+        }
+
         // Store label for delegate to track text reading
         labelQueue.sync {
             currentSpeechLabel = key
         }
         
-        // Always interrupt current speech so we don't queue stale announcements
-        priorityQueue.sync {
-            if synthesizer.isSpeaking {
-                DispatchQueue.main.async {
-                    self.synthesizer.stopSpeaking(at: .immediate)
-                }
+        if synthesizer.isSpeaking {
+            DispatchQueue.main.async {
+                self.synthesizer.stopSpeaking(at: .immediate)
             }
-            currentPriority = priority
         }
 
         let utterance = AVSpeechUtterance(string: phrase)
@@ -160,6 +170,7 @@ extension SpeechService: AVSpeechSynthesizerDelegate {
         DispatchQueue.main.async {
             if !synthesizer.isSpeaking {
                 self.isSpeaking = false
+                self.priorityQueue.sync { self.currentPriority = 0 }
                 // Notify if text reading finished
                 let label = self.labelQueue.sync { self.currentSpeechLabel }
                 if label == "textreading" {
@@ -174,6 +185,7 @@ extension SpeechService: AVSpeechSynthesizerDelegate {
         DispatchQueue.main.async {
             if !synthesizer.isSpeaking {
                 self.isSpeaking = false
+                self.priorityQueue.sync { self.currentPriority = 0 }
                 // Notify if text reading was cancelled
                 let label = self.labelQueue.sync { self.currentSpeechLabel }
                 if label == "textreading" {
