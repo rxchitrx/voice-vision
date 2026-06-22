@@ -1,4 +1,3 @@
-import Vision
 import Foundation
 import Vision
 import AVFoundation
@@ -30,8 +29,16 @@ final class TextRecognitionService: ObservableObject {
     private let processingInterval: TimeInterval = 0.3 // Faster cadence for responsive OCR
     
     // Minimum confidence for text recognition
-    private let minConfidence: Float = 0.4
+    private let minConfidence: Float = 0.55
     private let minBoundingBoxArea: CGFloat = 0.0008
+    private let spellChecker = UITextChecker()
+
+    private let usefulShortWords: Set<String> = [
+        "atm", "bus", "cab", "danger", "entry", "exit", "fire", "go", "help",
+        "in", "lift", "no", "open", "out", "pay", "pull", "push", "stop",
+        "toilet", "warning", "washroom", "yes"
+    ]
+    private let usefulAcronyms: Set<String> = ["ATM", "GST", "INR", "OTP", "PIN", "QR", "UPI"]
     
     // Stability filtering
     private var recentTextSnapshots: [String] = []
@@ -45,8 +52,8 @@ final class TextRecognitionService: ObservableObject {
     
     init() {
         textRequest = VNRecognizeTextRequest()
-        textRequest.recognitionLevel = .fast
-        textRequest.usesLanguageCorrection = false
+        textRequest.recognitionLevel = .accurate
+        textRequest.usesLanguageCorrection = true
         textRequest.recognitionLanguages = ["en-US"]
     }
     
@@ -80,12 +87,15 @@ final class TextRecognitionService: ObservableObject {
                           candidate.confidence >= self.minConfidence else { continue }
                     
                     let text = candidate.string
+                        .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
                     let boundingBox = observation.boundingBox
                     let area = boundingBox.width * boundingBox.height
                     
                     // Filter out very small or noise text
                     guard text.count >= 2 else { continue }
                     guard area >= self.minBoundingBoxArea else { continue }
+                    guard self.isMeaningfulText(text) else { continue }
                     
                     texts.append(RecognizedText(
                         text: text,
@@ -107,6 +117,75 @@ final class TextRecognitionService: ObservableObject {
                 print("Text recognition error:", error)
             }
         }
+    }
+
+    func filteredAnnouncementText(_ text: String) -> String? {
+        let cleaned = text
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard cleaned.count >= 2, isMeaningfulText(cleaned) else { return nil }
+        return cleaned
+    }
+
+    private func isMeaningfulText(_ text: String) -> Bool {
+        let tokens = text
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+
+        guard !tokens.isEmpty else { return false }
+
+        let singleCharacterTokens = tokens.filter { $0.count == 1 }.count
+        if tokens.count >= 4 && Double(singleCharacterTokens) / Double(tokens.count) >= 0.6 {
+            return false
+        }
+
+        let compactLetters = text.lowercased().filter(\.isLetter)
+        if looksLikeKeyboardSequence(compactLetters) {
+            return false
+        }
+
+        let numericTokens = tokens.filter { $0.contains(where: \.isNumber) }
+        let alphabeticTokens = tokens.filter { $0.contains(where: \.isLetter) }
+        if alphabeticTokens.isEmpty {
+            return !numericTokens.isEmpty && (text.contains("₹") || text.contains("$") || text.count >= 3)
+        }
+
+        let recognizableWords = alphabeticTokens.filter(isRecognizableWord)
+        if alphabeticTokens.count == 1 {
+            return recognizableWords.count == 1
+        }
+
+        let requiredWords = max(1, Int(ceil(Double(alphabeticTokens.count) * 0.5)))
+        return recognizableWords.count >= requiredWords
+    }
+
+    private func looksLikeKeyboardSequence(_ letters: String) -> Bool {
+        guard letters.count >= 4 else { return false }
+        let rows = ["qwertyuiop", "asdfghjkl", "zxcvbnm"]
+        return rows.contains { row in
+            row.contains(letters) || String(row.reversed()).contains(letters)
+        }
+    }
+
+    private func isRecognizableWord(_ token: String) -> Bool {
+        let lowercased = token.lowercased()
+        if usefulShortWords.contains(lowercased) {
+            return true
+        }
+
+        if usefulAcronyms.contains(token.uppercased()) {
+            return true
+        }
+
+        guard token.count >= 3 else { return false }
+        let range = NSRange(location: 0, length: (token as NSString).length)
+        return spellChecker.rangeOfMisspelledWord(
+            in: token,
+            range: range,
+            startingAt: 0,
+            wrap: false,
+            language: "en_US"
+        ).location == NSNotFound
     }
     
     private func applyStabilityFilter(_ text: String) -> String {

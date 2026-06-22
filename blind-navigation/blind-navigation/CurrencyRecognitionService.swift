@@ -33,10 +33,12 @@ final class CurrencyRecognitionService: ObservableObject {
     private var currencyInterpreter: Interpreter?
     private var currencyLabels: [String] = []
     private let modelInputSize = 224
-    private let modelConfidenceThreshold: Float = 0.70
+    private let modelConfidenceThreshold: Float = 0.85
+    private let modelConfidenceMargin: Float = 0.25
     
-    // Text recognition for finding ₹ symbol and numbers
+    // Presence checks prevent the closed-set classifier from labeling empty scenes.
     private let textRequest: VNRecognizeTextRequest
+    private let noteRectangleRequest: VNDetectRectanglesRequest
     
     private let ciContext = CIContext(options: nil)
     private let minLuminance: CGFloat = 0.08
@@ -93,6 +95,14 @@ final class CurrencyRecognitionService: ObservableObject {
         textRequest.recognitionLevel = .accurate
         textRequest.usesLanguageCorrection = false
         textRequest.recognitionLanguages = ["en-US"]
+
+        noteRectangleRequest = VNDetectRectanglesRequest()
+        noteRectangleRequest.maximumObservations = 3
+        noteRectangleRequest.minimumAspectRatio = 0.30
+        noteRectangleRequest.maximumAspectRatio = 0.75
+        noteRectangleRequest.minimumSize = 0.15
+        noteRectangleRequest.minimumConfidence = 0.60
+        noteRectangleRequest.quadratureTolerance = 25
         
         print("DEBUG: Currency recognition service initialized")
     }
@@ -150,20 +160,22 @@ final class CurrencyRecognitionService: ObservableObject {
             
             do {
                 // Run both ML model and text recognition in parallel
-                var mlResult: (label: String, confidence: Float)?
+                var mlResult: (label: String, confidence: Float, margin: Float)?
                 var textResults: [VNRecognizedTextObservation] = []
 
-                // 1) Run text recognition first (often the most reliable path for denominations)
-                try handler.perform([self.textRequest])
+                // Establish that a note-like object is present before asking the classifier for a denomination.
+                try handler.perform([self.textRequest, self.noteRectangleRequest])
                 if let results = self.textRequest.results {
                     textResults = results
                 }
-                
-                if let result = try self.classifyCurrency(pixelBuffer: pixelBuffer) {
+                let hasNoteRectangle = !(self.noteRectangleRequest.results?.isEmpty ?? true)
+
+                if hasNoteRectangle, let result = try self.classifyCurrency(pixelBuffer: pixelBuffer) {
                     if self.logTopPredictions {
-                        print("DEBUG: Currency TFLite top: \(result.label)=\(String(format: "%.2f", result.confidence))")
+                        print("DEBUG: Currency TFLite top: \(result.label)=\(String(format: "%.2f", result.confidence)), margin=\(String(format: "%.2f", result.margin))")
                     }
-                    if result.confidence >= self.modelConfidenceThreshold {
+                    if result.confidence >= self.modelConfidenceThreshold,
+                       result.margin >= self.modelConfidenceMargin {
                         mlResult = result
                         print("DEBUG: Currency ML candidate: '\(result.label)' (conf: \(String(format: "%.2f", result.confidence)))")
                     }
@@ -236,7 +248,7 @@ final class CurrencyRecognitionService: ObservableObject {
                 }
                 
                 // Method 3: Match numbers by color if no ₹ symbol
-                if detectedValue == nil && !numberObservations.isEmpty {
+                if detectedValue == nil && hasNoteRectangle && !numberObservations.isEmpty {
                     for (value, _) in numberObservations {
                         // If OCR found a known denomination, accept it (color match is optional).
                         detectedValue = value
@@ -248,6 +260,9 @@ final class CurrencyRecognitionService: ObservableObject {
                 // Process detected currency
                 if let value = detectedValue {
                     let detectionTime = Date()
+                    if recentCurrencyDetections.last?.value != value {
+                        recentCurrencyDetections.removeAll()
+                    }
                     self.recentCurrencyDetections.append((value: value, timestamp: detectionTime))
                     self.pruneOldDetections(now: detectionTime)
                     
@@ -259,12 +274,10 @@ final class CurrencyRecognitionService: ObservableObject {
                         self.updateDetectedCurrency(currency)
                         print("DEBUG: ✅ Currency confirmed: \(currency.name)")
                     } else {
-                        // Not enough consensus yet
-                        let currency = DetectedCurrency(value: value, name: "\(value) Rupees")
-                        self.updateDetectedCurrency(currency)
+                        self.updateDetectedCurrency(nil)
                     }
                 } else {
-                    // No currency detected
+                    self.recentCurrencyDetections.removeAll()
                     self.updateDetectedCurrency(nil)
                 }
             } catch {
@@ -273,7 +286,7 @@ final class CurrencyRecognitionService: ObservableObject {
         }
     }
 
-    private func classifyCurrency(pixelBuffer: CVPixelBuffer) throws -> (label: String, confidence: Float)? {
+    private func classifyCurrency(pixelBuffer: CVPixelBuffer) throws -> (label: String, confidence: Float, margin: Float)? {
         guard let interpreter = currencyInterpreter else { return nil }
 
         let source = CIImage(cvPixelBuffer: pixelBuffer).oriented(.right)
@@ -312,11 +325,13 @@ final class CurrencyRecognitionService: ObservableObject {
         let confidences = output.data.withUnsafeBytes {
             Array($0.bindMemory(to: Float32.self))
         }
-        guard let best = confidences.enumerated().max(by: { $0.element < $1.element }),
+        let ranked = confidences.enumerated().sorted { $0.element > $1.element }
+        guard ranked.count >= 2,
+              let best = ranked.first,
               currencyLabels.indices.contains(best.offset) else {
             return nil
         }
-        return (currencyLabels[best.offset], best.element)
+        return (currencyLabels[best.offset], best.element, best.element - ranked[1].element)
     }
     
     /// Extract currency value from ML model label

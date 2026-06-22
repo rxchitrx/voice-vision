@@ -1355,8 +1355,10 @@ struct ContentView: View {
     
     // Read the detected text aloud
     private func readDetectedText(_ text: String) {
-        let currentText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !currentText.isEmpty else { return }
+        guard let currentText = textRecognition.filteredAnnouncementText(text) else {
+            dismissTextPrompt()
+            return
+        }
         
         // Dismiss prompt first
         dismissTextPrompt()
