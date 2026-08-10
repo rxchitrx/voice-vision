@@ -17,6 +17,9 @@ final class DetectionService: ObservableObject {
     private let model: VNCoreMLModel?
     private let request: VNCoreMLRequest?
     private let queue = DispatchQueue(label: "DetectionQueue")
+    private var lastProcessedTime = Date.distantPast
+    private var isProcessing = false
+    private let processingInterval: TimeInterval = 0.15
 
     private let minConfidence: Float = 0.5 // tune 0.4–0.6
     private let personAlpha: CGFloat = 0.4
@@ -98,8 +101,15 @@ final class DetectionService: ObservableObject {
 
     func process(pixelBuffer: CVPixelBuffer) {
         guard !isPaused, let request = self.request else { return }
+        let now = Date()
+        guard !isProcessing, now.timeIntervalSince(lastProcessedTime) >= processingInterval else { return }
+        isProcessing = true
+        lastProcessedTime = now
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right)
         queue.async {
+            defer {
+                DispatchQueue.main.async { self.isProcessing = false }
+            }
             do {
                 try handler.perform([request])
                 guard let results = request.results as? [VNRecognizedObjectObservation] else { return }

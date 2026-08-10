@@ -6,26 +6,18 @@ import LocalAuthentication
 import UIKit
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var arCamera = ARCameraService()
     @StateObject private var detector = DetectionService()
     @StateObject private var textRecognition = TextRecognitionService()
     @StateObject private var currencyRecognition = CurrencyRecognitionService()
     @StateObject private var qrScanService = QRScanService()
     @StateObject private var speechService = SpeechService()
+    @StateObject private var perceptionCoordinator = PerceptionAnnouncementCoordinator()
     @StateObject private var miniCPMService = MiniCPMService()
 
-    // Debug/diagnostics
     @State private var lastARSessionError: String? = nil
     @State private var cameraAuthStatus: AVAuthorizationStatus = AVCaptureDevice.authorizationStatus(for: .video)
-    
-    // Track objects that have been announced (only reset when they leave frame)
-    @State private var announcedObjects: Set<String> = []
-    // Track objects in the last few frames to detect when they truly leave
-    @State private var recentlyDetectedObjects: [Set<String>] = []
-    private let frameHistorySize = 5 // Number of frames to check before considering object "gone"
-    // Global cooldown per label to prevent spam from micro-movements
-    @State private var lastAnnouncementTimeByLabel: [String: Date] = [:]
-    private let objectAnnouncementCooldown: TimeInterval = 4.0
     
     // Text reading confirmation
     @State private var detectedText: String? = nil
@@ -115,6 +107,9 @@ struct ContentView: View {
     // Error state
     @State private var initializationError: String? = nil
     @State private var arSessionStarted: Bool = false
+    @State private var arStartRequested = false
+    @State private var cameraAccessDenied = false
+    @State private var hasAnnouncedReadiness = false
 
     var body: some View {
         ZStack {
@@ -125,7 +120,7 @@ struct ContentView: View {
             // Show error message if initialization failed
             if let error = initializationError {
                 VStack(spacing: 20) {
-                    Text("Initialization Error")
+                    Text(cameraAccessDenied ? "Camera Access Required" : "Unable to Start Camera")
                         .font(.title)
                         .foregroundColor(.white)
                     Text(error)
@@ -133,9 +128,11 @@ struct ContentView: View {
                         .foregroundColor(.red)
                         .multilineTextAlignment(.center)
                         .padding()
-                    Text("Please check Xcode console for details")
-                        .font(.caption)
-                        .foregroundColor(.gray)
+                    if cameraAccessDenied {
+                        Button("Open Settings") { openSettings() }
+                            .buttonStyle(.borderedProminent)
+                            .accessibilityHint("Opens Settings so camera access can be enabled")
+                    }
                 }
                 .padding()
                 .background(Color.black)
@@ -153,57 +150,31 @@ struct ContentView: View {
                         Text("Initializing AR Camera...")
                             .foregroundColor(.white)
                             .font(.headline)
-                        Text("If this screen persists, check Xcode console")
-                            .foregroundColor(.gray)
-                            .font(.caption)
-                            .padding(.top)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .background(Color.black)
                 }
             }
 
-            // Lightweight always-on debug overlay (helps diagnose black screen on device)
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Debug")
-                    .font(.caption)
-                    .fontWeight(.semibold)
-                Text("Camera auth: \(debugCameraAuthString(cameraAuthStatus))")
-                    .font(.caption2)
-                Text("AR started: \(arSessionStarted ? "yes" : "no")")
-                    .font(.caption2)
-                Text("Has frames: \(arCamera.latestBuffer == nil ? "no" : "yes")")
-                    .font(.caption2)
-                if let last = lastARSessionError {
-                    Text("AR error: \(last)")
-                        .font(.caption2)
-                        .foregroundColor(.red)
-                        .lineLimit(3)
-                }
-            }
-            .padding(10)
-            .background(Color.black.opacity(0.55))
-            .foregroundColor(.white)
-            .cornerRadius(10)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .padding([.top, .leading], 12)
-            .zIndex(2000)
-
             VStack(alignment: .trailing, spacing: 8) {
                 HStack(spacing: 6) {
                     Button("Describe") { requestMiniCPMAnalysis(mode: .scene) }
+                        .accessibilityHint("Describes the current scene")
                         .padding(.horizontal, 8)
                         .padding(.vertical, 5)
                         .background(miniCPMMode == .scene ? Color.orange.opacity(0.85) : Color.black.opacity(0.55))
                         .foregroundColor(.white)
                         .cornerRadius(8)
                     Button("Read") { requestMiniCPMAnalysis(mode: .read) }
+                        .accessibilityHint("Reads visible text")
                         .padding(.horizontal, 8)
                         .padding(.vertical, 5)
                         .background(miniCPMMode == .read ? Color.orange.opacity(0.85) : Color.black.opacity(0.55))
                         .foregroundColor(.white)
                         .cornerRadius(8)
                     Button("Doc") { requestMiniCPMAnalysis(mode: .document) }
+                        .accessibilityLabel("Document")
+                        .accessibilityHint("Summarizes the visible document")
                         .padding(.horizontal, 8)
                         .padding(.vertical, 5)
                         .background(miniCPMMode == .document ? Color.orange.opacity(0.85) : Color.black.opacity(0.55))
@@ -265,6 +236,8 @@ struct ContentView: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(PlainButtonStyle())
+                .accessibilityLabel("Read detected text")
+                .accessibilityHint("Reads the text that was detected when the prompt appeared")
                 .zIndex(1000) // Ensure it's on top
             }
             
@@ -278,6 +251,7 @@ struct ContentView: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(PlainButtonStyle())
+                .accessibilityLabel("Stop reading")
                 .zIndex(1001) // Above text confirmation
             }
             
@@ -437,6 +411,7 @@ struct ContentView: View {
                 }
             )
             .ignoresSafeArea()
+            .accessibilityHidden(true)
         )
         .onReceive(arCamera.$latestBuffer.compactMap { $0 }) { buffer in
             // Only process detection/text when NOT in currency or QR pay mode
@@ -452,23 +427,33 @@ struct ContentView: View {
         .onReceive(detector.$detections) { detections in
             // Only handle detections when NOT in currency mode and NOT reading text
             if !isCurrencyModeActive && !isReadingText {
-                handleDetections(detections, announce: true)
+                handleDetections(detections, source: .yolo, announce: true)
             }
         }
         .onReceive(arCamera.$wallDetections) { walls in
-            if !isQRPayModeActive && !isReadingText {
-                handleDetections(walls, announce: true)
+            if !isCurrencyModeActive && !isQRPayModeActive && !isReadingText {
+                handleDetections(walls, source: .wall, announce: true)
             }
         }
         .onReceive(arCamera.$doorwayDetections) { doorways in
-            if !isQRPayModeActive && !isReadingText {
-                handleDetections(doorways, announce: true)
+            if !isCurrencyModeActive && !isQRPayModeActive && !isReadingText {
+                handleDetections(doorways, source: .doorway, announce: true)
             }
         }
         .onReceive(arCamera.$windowDetections) { windows in
-            if !isQRPayModeActive && !isReadingText {
-                handleDetections(windows, announce: false) // Detect but don't announce
+            if !isCurrencyModeActive && !isQRPayModeActive && !isReadingText {
+                handleDetections(windows, source: .yolo, announce: false) // Detect but don't announce
             }
+        }
+        .onReceive(arCamera.$obstacles3D) { obstacles in
+            if !isCurrencyModeActive && !isQRPayModeActive && !isReadingText {
+                submitMeshObstacles(obstacles)
+            }
+        }
+        .onReceive(arCamera.$isCameraReady.removeDuplicates()) { ready in
+            guard ready else { return }
+            arSessionStarted = true
+            announceReadinessIfNeeded()
         }
         .onReceive(textRecognition.$fullTextContent) { textContent in
             // Only handle text detection when NOT in currency mode
@@ -493,6 +478,11 @@ struct ContentView: View {
         }
         .onReceive(miniCPMService.$lastError.compactMap { $0 }) { error in
             lastARSessionError = error
+            guard !isCurrencyModeActive && !isQRPayModeActive else { return }
+            perceptionCoordinator.clear()
+            speechService.discardPerception()
+            suppressObjectAnnouncementsUntil = Date().addingTimeInterval(miniCPMObjectSuppressionWindow)
+            speechService.speakWithPriority(label: "MiniCPMError", phrase: error, priority: 3)
         }
         .onReceive(speechService.$isSpeaking) { isSpeaking in
             // Pause text and currency recognition when speech is active to avoid conflicts
@@ -528,17 +518,14 @@ struct ContentView: View {
             
             print("DEBUG: Initializing speech service...")
             speechService.initialize()
+            perceptionCoordinator.onAnnouncement = { request in
+                speechService.submit(request)
+            }
 
             if !detector.isAvailable {
                 let message = "Object detector model is unavailable. OCR and MiniCPM features can still run."
                 print("ERROR: \(message)")
                 self.lastARSessionError = message
-            }
-            
-            // Test speech output to verify it works
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                print("DEBUG: Testing speech output...")
-                speechService.speak(label: "Test", phrase: "VoiceVision app is ready")
             }
             
             print("DEBUG: ContentView initialization complete")
@@ -554,6 +541,27 @@ struct ContentView: View {
                 requestCameraAccessAndStartAR()
             }
         }
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            case .background:
+                perceptionCoordinator.isEnabled = false
+                perceptionCoordinator.clear()
+                speechService.discardAmbient()
+                detector.isPaused = true
+                textRecognition.isPaused = true
+                arSessionStarted = false
+                arStartRequested = false
+                arCamera.stop()
+            case .active:
+                perceptionCoordinator.clear()
+                perceptionCoordinator.isEnabled = true
+                detector.isPaused = isCurrencyModeActive || isQRPayModeActive
+                textRecognition.isPaused = isCurrencyModeActive || isQRPayModeActive
+                if initializationError == nil { requestCameraAccessAndStartAR() }
+            default:
+                break
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("ARSessionError"))) { note in
             let message: String
             if let err = note.object as? Error {
@@ -562,6 +570,7 @@ struct ContentView: View {
                 message = "Unknown ARSession error"
             }
             DispatchQueue.main.async {
+                self.arStartRequested = false
                 self.lastARSessionError = message
                 self.initializationError = "ARSession error: \(message)"
             }
@@ -583,16 +592,20 @@ struct ContentView: View {
                         print("DEBUG: Camera permission granted")
                         self.startARNow()
                     } else {
-                        let errorMsg = "Camera permission is required to show the camera feed. Enable it in Settings > Privacy & Security > Camera."
+                        let errorMsg = "Camera access is required. Enable it in Settings."
                         print("ERROR: \(errorMsg)")
                         self.initializationError = errorMsg
+                        self.cameraAccessDenied = true
+                        self.speechService.submit(SpeechRequest(label: "CameraPermission", phrase: errorMsg, priority: .status, category: .error))
                     }
                 }
             }
         case .denied, .restricted:
-            let errorMsg = "Camera permission is not available. Enable it in Settings > Privacy & Security > Camera."
+            let errorMsg = "Camera access is required. Enable it in Settings."
             print("ERROR: \(errorMsg)")
             initializationError = errorMsg
+            cameraAccessDenied = true
+            speechService.submit(SpeechRequest(label: "CameraPermission", phrase: errorMsg, priority: .status, category: .error))
         @unknown default:
             let errorMsg = "Unknown camera permission state."
             print("ERROR: \(errorMsg)")
@@ -601,27 +614,29 @@ struct ContentView: View {
     }
 
     private func startARNow() {
+        guard !arStartRequested else { return }
+        arStartRequested = true
         print("DEBUG: Starting AR camera...")
+        cameraAccessDenied = false
+        initializationError = nil
         arCamera.start()
-        // Mark AR session as started after a short delay
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            self.arSessionStarted = true
-            print("DEBUG: AR session marked as started")
-        }
     }
 
-    private func debugCameraAuthString(_ status: AVAuthorizationStatus) -> String {
-        switch status {
-        case .authorized: return "authorized"
-        case .notDetermined: return "notDetermined"
-        case .denied: return "denied"
-        case .restricted: return "restricted"
-        @unknown default: return "unknown"
-        }
+    private func announceReadinessIfNeeded() {
+        guard !hasAnnouncedReadiness,
+              cameraAuthStatus == .authorized,
+              arCamera.isCameraReady else { return }
+        hasAnnouncedReadiness = true
+        speechService.submit(SpeechRequest(label: "Readiness", phrase: "SecondSight ready.", priority: .status, category: .modeStatus))
+    }
+
+    private func openSettings() {
+        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+        UIApplication.shared.open(url)
     }
     
 
-    private func handleDetections(_ detections: [Detection], announce: Bool = true) {
+    private func handleDetections(_ detections: [Detection], source: PerceptionSource, announce: Bool = true) {
         // Filter to valid detections (speakable or silent labels)
         let validDetections = detections.filter { detection in
             let label = detection.label.lowercased()
@@ -657,149 +672,31 @@ struct ContentView: View {
             return true
         }
         
-        // Create unique keys for currently detected objects (label + position)
-        let currentObjectKeys = Set(validDetections.map { createObjectKey(for: $0) })
-        
-        // Add current frame to history
-        recentlyDetectedObjects.append(currentObjectKeys)
-        if recentlyDetectedObjects.count > frameHistorySize {
-            recentlyDetectedObjects.removeFirst()
-        }
-        
-        // Find objects that have truly left the frame (not in last N frames)
-        let objectsStillPresent = recentlyDetectedObjects.reduce(Set<String>()) { $0.union($1) }
-        
-        // Remove objects from announced set if they've been gone for several frames
-        announcedObjects = announcedObjects.intersection(objectsStillPresent)
-        
-        // Only announce if requested (for speakable objects)
         guard announce else { return }
         guard !shouldSuppressObjectAnnouncements() else { return }
-        
-        // Announce only objects that haven't been announced yet
-        for detection in validDetections {
-            let objectKey = createObjectKey(for: detection)
-            let label = detection.label.lowercased()
-            
-            // Skip if already announced
-            guard !announcedObjects.contains(objectKey) else { continue }
-            
-            // Skip silent labels (windows)
-            guard !silentLabels.contains(label) else { continue }
-            
-            // Only announce if in speakable list
-            guard speakableLabels.contains(label) else { continue }
-            
-            // Global cooldown per label to avoid spam from micro-movements
-            let now = Date()
-            if let lastTime = lastAnnouncementTimeByLabel[label],
-               now.timeIntervalSince(lastTime) < objectAnnouncementCooldown {
-                continue
-            }
-            lastAnnouncementTimeByLabel[label] = now
-            
-            let position = describePosition(for: detection)
-            let distance = estimateDistance(for: detection.boundingBox)
-            let labelCapitalized = detection.label.capitalized
-            
-            // Include distance for all large objects
-            // Make announcements more concise and clear
-            let phrase: String
-            if distance.contains("half") || distance.contains("1 meter") {
-                // Close objects - emphasize proximity
-                phrase = "\(labelCapitalized) \(position), \(distance). Be careful."
-            } else {
-                phrase = "\(labelCapitalized) \(position), \(distance)"
-            }
-
-            DispatchQueue.main.async {
-                self.speechService.speak(label: labelCapitalized, phrase: phrase)
-            }
-            
-            // Mark as announced
-            announcedObjects.insert(objectKey)
-        }
-        
-        announceMeshObstacleIfNeeded()
-    }
-    
-    /// Creates a unique key for an object based on label and position
-    /// This allows tracking the same object type in different positions separately
-    private func createObjectKey(for detection: Detection) -> String {
-        let label = detection.label.lowercased()
-        let position = describePosition(for: detection)
-        return "\(label)_\(position)"
-    }
-
-    private func describePosition(for detection: Detection) -> String {
-        let centerX = detection.boundingBox.midX
-        if centerX < 0.33 { return "on your left" }
-        if centerX > 0.66 { return "on your right" }
-        return "in front of you"
-    }
-
-    private func describeProximity(for height: CGFloat) -> String? {
-        if height > 0.6 { return "Very close" }
-        if height > 0.4 { return "Close" }
-        return nil
-    }
-    
-    /// Estimates approximate distance to object based on bounding box size
-    /// Uses normalized height (0.0 to 1.0) as proxy for distance
-    /// Returns distance in meters as a string
-    private func estimateDistance(for boundingBox: CGRect) -> String {
-        // Use both height and area for better distance estimation
-        let height = boundingBox.height
-        let area = boundingBox.width * boundingBox.height
-        
-        // Calibration: larger objects appear larger in frame when closer
-        // These thresholds are calibrated for typical indoor distances
-        if height > 0.7 || area > 0.5 {
-            return "half a meter away"
-        } else if height > 0.5 || area > 0.3 {
-            return "1 meter away"
-        } else if height > 0.35 || area > 0.15 {
-            return "2 meters away"
-        } else if height > 0.25 || area > 0.08 {
-            return "2 and a half meters away"
-        } else {
-            return "3 meters away"
-        }
-    }
-    
-    
-    private func announceMeshObstacleIfNeeded() {
-        guard !shouldSuppressObjectAnnouncements() else {
-            return
-        }
-        guard let nearestObstacle = arCamera.obstacles3D.first(where: { $0.type == .unknown }) else {
-            return
-        }
-        
-        let label = "obstacle"
-        let now = Date()
-        if let lastTime = lastAnnouncementTimeByLabel[label],
-           now.timeIntervalSince(lastTime) < objectAnnouncementCooldown {
-            return
-        }
-        lastAnnouncementTimeByLabel[label] = now
-        
-        let distance = estimateDistanceFor3DObstacle(nearestObstacle)
-        let phrase = "Obstacle ahead, \(distance)."
-        DispatchQueue.main.async {
-            self.speechService.speak(label: "Obstacle", phrase: phrase)
+        let speakable = validDetections.filter { !silentLabels.contains($0.label.lowercased()) }
+        arCamera.perceptionCandidates(for: speakable, source: source) { candidates in
+            guard !shouldSuppressObjectAnnouncements() else { return }
+            perceptionCoordinator.submitSnapshot(candidates, source: source)
         }
     }
 
-    private func estimateDistanceFor3DObstacle(_ obstacle: Obstacle3D) -> String {
-        guard let userPosition = arCamera.userPosition else {
-            return "nearby"
+    private func submitMeshObstacles(_ obstacles: [Obstacle3D]) {
+        guard !shouldSuppressObjectAnnouncements(), let userPosition = arCamera.userPosition else { return }
+        let candidates = obstacles.filter { $0.type == .unknown }.map { obstacle in
+            let meters = simd_length(obstacle.position - userPosition)
+            return PerceptionCandidate(
+                identity: "\(PerceptionSource.meshObstacle)-obstacle-ahead",
+                label: "obstacle",
+                source: .meshObstacle,
+                confidence: obstacle.confidence,
+                horizontalPosition: .ahead,
+                distance: .measured(meters: meters),
+                boundingBox: obstacle.boundingBox,
+                timestamp: Date()
+            )
         }
-            let distance = simd_length(obstacle.position - userPosition)
-        if distance < 0.8 { return "very close" }
-        if distance < 1.5 { return "1 meter away" }
-        if distance < 2.5 { return "2 meters away" }
-        return "more than 2 meters away"
+        perceptionCoordinator.submitSnapshot(candidates, source: .meshObstacle)
     }
 
     // MARK: - Currency Handling
@@ -836,6 +733,10 @@ struct ContentView: View {
         isCurrencyModeActive = true
         isQRPayModeActive = false
 
+        perceptionCoordinator.isEnabled = false
+        perceptionCoordinator.clear()
+        speechService.discardPerception()
+
         TorchService.shared.setTorch(enabled: true, level: 1.0)
         currencyRecognition.activate()
         qrScanService.deactivate()
@@ -852,6 +753,8 @@ struct ContentView: View {
 
     private func deactivateCurrencyMode(announce: Bool) {
         isCurrencyModeActive = false
+        perceptionCoordinator.clear()
+        perceptionCoordinator.isEnabled = true
         TorchService.shared.setTorch(enabled: false)
         currencyRecognition.deactivate()
         detector.isPaused = false
@@ -1211,7 +1114,7 @@ struct ContentView: View {
     private func miniCPMPromptForMode(_ mode: MiniCPMMode) -> String {
         switch mode {
         case .scene:
-            return "Describe only the most important navigation detail in one sentence of at most 25 words."
+            return "Describe everything visible in the camera view in a detailed but concise, to-the-point way. Use only one to three sentences describing exactly what you see. Do not mention that you are an AI, do not explain your process, do not add warnings, introductions, conclusions, or summaries, and do not say anything unrelated to the visible scene."
         case .read:
             return "Read and explain the most relevant visible text clearly and briefly."
         case .document:
@@ -1222,15 +1125,23 @@ struct ContentView: View {
     private func requestMiniCPMAnalysis(mode: MiniCPMMode) {
         guard !isCurrencyModeActive && !isQRPayModeActive else { return }
         guard !miniCPMService.isProcessing else {
-            speechService.speakWithPriority(label: "MiniCPM", phrase: "Description is already processing.", priority: 1)
+            perceptionCoordinator.clear()
+            speechService.discardPerception()
+            suppressObjectAnnouncementsUntil = Date().addingTimeInterval(miniCPMObjectSuppressionWindow)
+            speechService.speakWithPriority(label: "MiniCPMProcessing", phrase: "Description is already processing.", priority: 3)
             return
         }
         guard let buffer = arCamera.latestBuffer else {
-            speechService.speakWithPriority(label: "MiniCPM", phrase: "Camera is not ready yet.", priority: 1)
+            perceptionCoordinator.clear()
+            speechService.discardPerception()
+            suppressObjectAnnouncementsUntil = Date().addingTimeInterval(miniCPMObjectSuppressionWindow)
+            speechService.speakWithPriority(label: "MiniCPMCamera", phrase: "Camera is not ready yet.", priority: 3)
             return
         }
 
         miniCPMMode = mode
+        perceptionCoordinator.clear()
+        speechService.discardPerception()
         suppressObjectAnnouncementsUntil = Date().addingTimeInterval(miniCPMObjectSuppressionWindow)
         miniCPMService.analyze(
             pixelBuffer: buffer,
@@ -1246,14 +1157,18 @@ struct ContentView: View {
         guard !isQRPayModeActive && !isCurrencyModeActive else { return }
 
         let now = Date()
-        guard now.timeIntervalSince(lastMiniCPMSpokenTime) >= miniCPMSpeechCooldown else { return }
-        guard cleaned != lastMiniCPMSpokenSummary else { return }
+        if mode != .scene {
+            guard now.timeIntervalSince(lastMiniCPMSpokenTime) >= miniCPMSpeechCooldown else { return }
+            guard cleaned != lastMiniCPMSpokenSummary else { return }
+        }
 
         if mode == miniCPMMode || mode == .scene {
             lastMiniCPMSpokenSummary = cleaned
             lastMiniCPMSpokenTime = now
-            suppressObjectAnnouncementsUntil = now.addingTimeInterval(3.0)
-            speechService.speakWithPriority(label: "MiniCPM", phrase: cleaned, priority: 2)
+            perceptionCoordinator.clear()
+            speechService.discardPerception()
+            suppressObjectAnnouncementsUntil = now.addingTimeInterval(miniCPMObjectSuppressionWindow)
+            speechService.speakWithPriority(label: "MiniCPM", phrase: cleaned, priority: 3)
 
             if mode == .document, !miniCPMService.latestStructuredFields.isEmpty {
                 let parsed = miniCPMService.latestStructuredFields
@@ -1282,74 +1197,54 @@ struct ContentView: View {
         
         let now = Date()
         
-        // Only prompt for meaningful text (5+ characters)
         guard normalizedText.count >= 5 else {
-            // Keep prompt visible briefly so taps still work
             if showTextConfirmation,
                now.timeIntervalSince(lastTextDetectedTime) > textPromptGracePeriod {
                 dismissTextPrompt()
             }
             return
         }
-        
-        // Update last seen time
+
         lastTextDetectedTime = now
-        
-        // CRITICAL: 5-second timeout - cannot say "Text detected" again until 5 seconds have passed
+
+        let displayText = textContent.trimmingCharacters(in: .whitespacesAndNewlines)
+
         guard now.timeIntervalSince(lastPromptAnnouncementTime) >= textPromptCooldown else {
-            // Even if we can't announce, update the current text (no queue - always latest)
-            DispatchQueue.main.async {
-                let displayText = textContent.trimmingCharacters(in: .whitespacesAndNewlines)
-                self.detectedText = displayText
-                self.showTextConfirmation = true // Keep prompt active if it was active
-            }
-            return // Don't announce "Text detected" if we just said it
+            detectedText = displayText
+            showTextConfirmation = true
+            return
         }
-        
-        // Check if we've already prompted for similar text recently
+
         let isSimilarText = isTextSimilar(normalizedText, to: lastPromptedText)
         let isInCooldown = now.timeIntervalSince(lastPromptTime) < textPromptCooldown
-        
-        // Don't prompt if it's similar text and we're in cooldown
+
         if isSimilarText && isInCooldown {
-            // Still update current text (no queue - always latest)
-            DispatchQueue.main.async {
-                let displayText = textContent.trimmingCharacters(in: .whitespacesAndNewlines)
-                self.detectedText = displayText
-                self.showTextConfirmation = true
-            }
+            detectedText = displayText
+            showTextConfirmation = true
             return
         }
-        
-        // Don't prompt if we just read text (cooldown after reading)
+
         guard now.timeIntervalSince(lastTextAnnouncementTime) >= textPromptCooldown else {
-            // Still update current text (no queue - always latest)
-            DispatchQueue.main.async {
-                let displayText = textContent.trimmingCharacters(in: .whitespacesAndNewlines)
-                self.detectedText = displayText
-                self.showTextConfirmation = true // Keep prompt active
-            }
+            detectedText = displayText
+            showTextConfirmation = true
             return
         }
-        
-        // Check if current detected text is similar to what we're showing
+
         let isSimilarToCurrent = isTextSimilar(normalizedText, to: detectedText?.lowercased())
-        
-        // Always update to latest text (no queue - replace old text)
-        DispatchQueue.main.async {
-            // Use original text (not normalized) for display/reading
-            let displayText = textContent.trimmingCharacters(in: .whitespacesAndNewlines)
-            self.detectedText = displayText // Always update to latest text
-            self.showTextConfirmation = true
-            
-            // Only announce if text is meaningfully different
-            if !isSimilarToCurrent {
-                self.lastPromptedText = normalizedText
-                self.lastPromptTime = now
-                self.lastPromptAnnouncementTime = now // Track when we said "Text detected"
-                // Announce prompt for blind users
-                self.speechService.speak(label: "Text", phrase: "Text detected. Tap screen to read.")
-            }
+
+        detectedText = displayText
+        showTextConfirmation = true
+
+        if !isSimilarToCurrent {
+            lastPromptedText = normalizedText
+            lastPromptTime = now
+            lastPromptAnnouncementTime = now
+            speechService.submit(SpeechRequest(
+                label: "TextPrompt",
+                phrase: "Text detected. Tap screen to read.",
+                priority: .status,
+                category: .ocrPrompt
+            ))
         }
     }
     
@@ -1396,7 +1291,8 @@ struct ContentView: View {
         DispatchQueue.main.async {
             // Mark that we're reading text immediately (notification will also set this, but we set it early for UI)
             self.isReadingText = true
-            self.speechService.speak(label: "TextReading", phrase: phrase)
+            self.perceptionCoordinator.clear()
+            self.speechService.readTextImmediately(label: "TextReading", phrase: phrase)
             self.lastTextAnnouncementTime = Date()
             // Clear the prompted text so it can be prompted again later if needed
             self.lastPromptedText = nil

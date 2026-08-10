@@ -87,7 +87,7 @@ function buildFallbackPerceptionResponse(mode, prompt, ocrText) {
       summary = 'No document text detected. Try holding the camera steady.';
     }
   } else if (cleanPrompt) {
-    summary = cleanPrompt.slice(0, 220);
+    summary = 'The description model is not available right now.';
   }
 
   return {
@@ -106,9 +106,10 @@ function buildPerceptionInstruction(mode, prompt, ocrText) {
   }
 
   if (normalizedMode === 'scene') {
-    lines.push('Describe the scene in exactly one concise sentence of at most 25 words.');
-    lines.push('Prioritize navigation and safety-relevant details.');
-    lines.push('Do not add an introduction, conclusion, or follow-up summary.');
+    lines.push('Describe everything visible in the camera view in a detailed but concise, to-the-point way.');
+    lines.push('Use only one to three sentences describing exactly what you see.');
+    lines.push('Do not mention that you are an AI, do not explain your process, do not add warnings, introductions, conclusions, or summaries, and do not say anything unrelated to the visible scene.');
+    lines.push('Output JSON only with one key: description (string). The description must directly state what is visible and must not be labeled or phrased as a summary.');
   } else if (normalizedMode === 'read') {
     lines.push('Read and explain visible text briefly and clearly.');
   } else {
@@ -121,7 +122,9 @@ function buildPerceptionInstruction(mode, prompt, ocrText) {
     lines.push(`OCR context:\n${cleanOCR.slice(0, 2500)}`);
   }
 
-  lines.push('Output JSON only with keys: summary (string), structuredFields (object).');
+  if (normalizedMode !== 'scene') {
+    lines.push('Output JSON only with keys: summary (string), structuredFields (object).');
+  }
   return lines.join('\n\n');
 }
 
@@ -168,7 +171,9 @@ function parseLMStudioChatResponse(data) {
       const parsed = JSON.parse(summary);
       if (parsed && typeof parsed === 'object') {
         return {
-          summary: typeof parsed.summary === 'string' ? parsed.summary.trim() : summary,
+          summary: typeof parsed.description === 'string'
+            ? parsed.description.trim()
+            : (typeof parsed.summary === 'string' ? parsed.summary.trim() : summary),
           structuredFields: parsed.structuredFields && typeof parsed.structuredFields === 'object'
             ? parsed.structuredFields
             : parseStructuredFieldsFromText(summary)
@@ -213,11 +218,12 @@ async function callMiniCPMViaLMStudio({ endpoint, timeoutMs, apiKey, mode, promp
   const payload = {
     model,
     temperature: Number(process.env.MINICPM_TEMPERATURE || 0.2),
-    max_tokens: Number(process.env.MINICPM_MAX_TOKENS || 700),
     messages: [
       {
         role: 'system',
-        content: 'You are an accessibility assistant for scene understanding and document reading.'
+        content: mode === 'scene'
+          ? 'Directly describe the visible scene for a blind user. Never provide or label a summary.'
+          : 'You are an accessibility assistant for scene understanding and document reading.'
       },
       {
         role: 'user',
@@ -225,6 +231,9 @@ async function callMiniCPMViaLMStudio({ endpoint, timeoutMs, apiKey, mode, promp
       }
     ]
   };
+  if (mode !== 'scene') {
+    payload.max_tokens = Number(process.env.MINICPM_MAX_TOKENS || 700);
+  }
 
   const headers = { 'Content-Type': 'application/json' };
   if (apiKey) {

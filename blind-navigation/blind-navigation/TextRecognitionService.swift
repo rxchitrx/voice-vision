@@ -204,7 +204,6 @@ final class TextRecognitionService: ObservableObject {
         if matches >= requiredStableMatches {
             return text
         }
-        
         return ""
     }
     
@@ -239,19 +238,34 @@ enum MiniCPMMode: String, Codable, CaseIterable {
     case document
 }
 
-private struct MiniCPMAnalyzeRequest: Encodable {
+private nonisolated struct MiniCPMAnalyzeRequest: Encodable {
     let mode: String
     let prompt: String
     let ocrText: String
     let imageBase64: String?
 }
 
-private struct MiniCPMAnalyzeResponse: Decodable {
+private nonisolated struct MiniCPMAnalyzeResponse: Decodable {
     let provider: String?
     let mode: String?
     let summary: String
     let structuredFields: [String: String]?
     let warning: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case provider, mode, summary, description, structuredFields, warning
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        provider = try? container.decode(String.self, forKey: .provider)
+        mode = try? container.decode(String.self, forKey: .mode)
+        warning = try? container.decode(String.self, forKey: .warning)
+        summary = (try? container.decode(String.self, forKey: .description))
+            ?? (try? container.decode(String.self, forKey: .summary))
+            ?? ""
+        structuredFields = try? container.decode([String: String].self, forKey: .structuredFields)
+    }
 }
 
 /// Lightweight client for backend-proxied MiniCPM analysis.

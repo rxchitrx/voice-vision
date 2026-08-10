@@ -10,6 +10,8 @@ final class ARCameraService: NSObject, ObservableObject {
     @Published var windowDetections: [Detection] = []
     @Published var userPosition: simd_float3?
     @Published var obstacles3D: [Obstacle3D] = []
+    @Published private(set) var isCameraReady = false
+    @Published private(set) var isCameraStable = false
     
     private let arSession = ARSession()
     private var trackedPlanes: [UUID: ARPlaneAnchor] = [:]
@@ -18,10 +20,13 @@ final class ARCameraService: NSObject, ObservableObject {
     private let planeTimeout: TimeInterval = 2.0 // Remove planes not updated in 2 seconds
     private var trackedObjects: [UUID: (position: simd_float3, size: simd_float3, type: Obstacle3D.ObstacleType, label: String)] = [:]
     private let meshObstacleDistanceThreshold: Float = 1.2
+    private var lastObstacleUpdate = Date.distantPast
+    private var lastPlaneDetectionUpdate = Date.distantPast
+    private var cameraMotionSamples: [(date: Date, transform: simd_float4x4)] = []
     private let meshSamplePoints: [CGPoint] = [
-        CGPoint(x: 0.2, y: 0.2), CGPoint(x: 0.5, y: 0.2), CGPoint(x: 0.8, y: 0.2),
-        CGPoint(x: 0.2, y: 0.5), CGPoint(x: 0.5, y: 0.5), CGPoint(x: 0.8, y: 0.5),
-        CGPoint(x: 0.2, y: 0.8), CGPoint(x: 0.5, y: 0.8), CGPoint(x: 0.8, y: 0.8)
+        CGPoint(x: 0.35, y: 0.35), CGPoint(x: 0.5, y: 0.35), CGPoint(x: 0.65, y: 0.35),
+        CGPoint(x: 0.35, y: 0.5), CGPoint(x: 0.5, y: 0.5), CGPoint(x: 0.65, y: 0.5),
+        CGPoint(x: 0.35, y: 0.65), CGPoint(x: 0.5, y: 0.65), CGPoint(x: 0.65, y: 0.65)
     ]
     
     // Doorway detection parameters
@@ -39,6 +44,7 @@ final class ARCameraService: NSObject, ObservableObject {
     override init() {
         super.init()
         arSession.delegate = self
+        arSession.delegateQueue = queue
     }
     
     func start() {
@@ -103,14 +109,49 @@ final class ARCameraService: NSObject, ObservableObject {
     
     /// Clear all tracking state (used during relocalization)
     func clearTrackingState() {
-        trackedPlanes.removeAll()
-        lastPlaneUpdate.removeAll()
+        queue.async { [weak self] in
+            self?.trackedPlanes.removeAll()
+            self?.lastPlaneUpdate.removeAll()
+            self?.cameraMotionSamples.removeAll()
+            self?.lastObstacleUpdate = .distantPast
+            self?.lastPlaneDetectionUpdate = .distantPast
+        }
         DispatchQueue.main.async {
             self.wallDetections = []
             self.doorwayDetections = []
             self.windowDetections = []
             self.latestBuffer = nil
             self.obstacles3D = []
+            self.isCameraReady = false
+            self.isCameraStable = false
+        }
+    }
+
+    /// Resolves depth for a group of Vision detections without retaining an ARFrame
+    /// beyond this queue operation. Visual fallback remains explicitly qualitative.
+    func perceptionCandidates(for detections: [Detection], source: PerceptionSource,
+                              completion: @escaping ([PerceptionCandidate]) -> Void) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let frame = self.arSession.currentFrame
+            let now = Date()
+            let candidates = detections.map { detection in
+                let position = HorizontalPosition(centerX: detection.boundingBox.midX)
+                let distance = frame.flatMap { self.measuredDistance(for: detection.boundingBox, frame: $0) }
+                    .map(DistanceEstimate.measured) ?? self.qualitativeDistance(for: detection.boundingBox)
+                let identity = "\(source)-\(detection.label.lowercased())-\(position.rawValue)"
+                return PerceptionCandidate(
+                    identity: identity,
+                    label: detection.label.lowercased(),
+                    source: source,
+                    confidence: detection.confidence,
+                    horizontalPosition: position,
+                    distance: distance,
+                    boundingBox: detection.boundingBox,
+                    timestamp: now
+                )
+            }
+            DispatchQueue.main.async { completion(candidates) }
         }
     }
     
@@ -147,21 +188,15 @@ final class ARCameraService: NSObject, ObservableObject {
             let planePos = simd_float3(plane.transform.columns.3.x,
                                      plane.transform.columns.3.y,
                                      plane.transform.columns.3.z)
-            // extent is deprecated in iOS 16+ but still available
-            // In iOS 16+, we could calculate from geometry.bounds, but extent still works
-            // Using deprecated API as ARPlaneGeometry doesn't expose extent property
-            #if swift(>=5.0)
-            // Suppress deprecation warning - extent still works and is needed
-            #endif
-            let extent = plane.extent
+            let extent = plane.planeExtent
             
             // Only add if plane is reasonably sized
-            guard extent.x > 0.3 && extent.z > 0.3 else { continue }
+            guard extent.width > 0.3 && extent.height > 0.3 else { continue }
             
             let obstacle = Obstacle3D(
                 type: .wall,
                 position: planePos,
-                size: simd_float3(extent.x, extent.y, extent.z),
+                size: simd_float3(extent.width, extent.height, 0.1),
                 boundingBox: nil,
                 confidence: 0.9
             )
@@ -234,7 +269,7 @@ final class ARCameraService: NSObject, ObservableObject {
         }
         
         // Add generic mesh-based obstacles (LiDAR)
-        if let meshObstacle = detectNearestMeshObstacle(cameraTransform: cameraTransform, cameraPosition: cameraPosition) {
+        if let meshObstacle = detectNearestMeshObstacle(frame: frame, cameraTransform: cameraTransform, cameraPosition: cameraPosition) {
             obstacles.append(meshObstacle)
         }
         
@@ -330,8 +365,8 @@ final class ARCameraService: NSObject, ObservableObject {
                     depths.append(lidarDepth)
                 }
             }
-            if let minDepth = depths.min() {
-                return minDepth
+            if depths.count >= 4 {
+                return depths.sorted()[depths.count / 2]
             }
         }
         
@@ -379,21 +414,15 @@ final class ARCameraService: NSObject, ObservableObject {
         return simd_normalize(worldDirection)
     }
 
-    private func detectNearestMeshObstacle(cameraTransform: simd_float4x4,
+    private func detectNearestMeshObstacle(frame: ARFrame,
+                                          cameraTransform: simd_float4x4,
                                           cameraPosition: simd_float3) -> Obstacle3D? {
-        guard let frame = arSession.currentFrame else { return nil }
-
         let samplePoints = meshSamplePoints
         guard !samplePoints.isEmpty else { return nil }
 
-        var closestDistance: Float = .greatestFiniteMagnitude
-
-        for point in samplePoints {
-            if let depth = getDepthAt(screenPoint: point, frame: frame), depth < closestDistance {
-                closestDistance = depth
-            }
-        }
-
+        let depths = samplePoints.compactMap { getDepthAt(screenPoint: $0, frame: frame) }.sorted()
+        guard depths.count >= 4 else { return nil }
+        let closestDistance = depths[depths.count / 2]
         guard closestDistance <= meshObstacleDistanceThreshold else { return nil }
 
         let worldDirection = screenToWorldDirection(CGPoint(x: 0.5, y: 0.5), frame: frame)
@@ -432,17 +461,37 @@ final class ARCameraService: NSObject, ObservableObject {
         guard gridSize > 1 else {
             return [CGPoint(x: box.midX, y: box.midY)]
         }
-        let stepX = box.width / CGFloat(gridSize - 1)
-        let stepY = box.height / CGFloat(gridSize - 1)
+        let insetBox = box.insetBy(dx: box.width * 0.2, dy: box.height * 0.2)
+        let stepX = insetBox.width / CGFloat(gridSize - 1)
+        let stepY = insetBox.height / CGFloat(gridSize - 1)
         var points: [CGPoint] = []
         for row in 0..<gridSize {
             for col in 0..<gridSize {
-                let x = box.minX + CGFloat(col) * stepX
-                let y = box.minY + CGFloat(row) * stepY
-                points.append(CGPoint(x: x, y: y))
+                let visionX = insetBox.minX + CGFloat(col) * stepX
+                let visionY = insetBox.minY + CGFloat(row) * stepY
+                // Vision is lower-left in the portrait-oriented image. AR depth is
+                // top-left in the landscape camera image used with orientation .right.
+                points.append(CGPoint(x: 1.0 - visionY, y: 1.0 - visionX))
             }
         }
         return points
+    }
+
+    private func measuredDistance(for box: CGRect, frame: ARFrame) -> Float? {
+        let depths = depthSamplePoints(for: box, gridSize: 3)
+            .compactMap { getDepthAt(screenPoint: $0, frame: frame) }
+            .filter { $0.isFinite && $0 > 0 && $0 < 10 }
+            .sorted()
+        guard depths.count >= 4 else { return nil }
+        return depths[depths.count / 2]
+    }
+
+    private func qualitativeDistance(for box: CGRect) -> DistanceEstimate {
+        let area = box.width * box.height
+        if box.height > 0.7 || area > 0.5 { return .qualitative(.veryClose) }
+        if box.height > 0.5 || area > 0.3 { return .qualitative(.close) }
+        if box.height > 0.3 || area > 0.12 { return .qualitative(.nearby) }
+        return .qualitative(.fartherAhead)
     }
 
     
@@ -485,12 +534,9 @@ final class ARCameraService: NSObject, ObservableObject {
         guard screenX > -0.2 && screenX < 1.2 && 
               screenY > -0.2 && screenY < 1.2 else { return nil }
         
-        // Estimate bounding box based on plane extent and distance
-        // extent is deprecated in iOS 16+ but still available
-        // Using deprecated API as ARPlaneGeometry doesn't expose extent property
-        let extent = anchor.extent
-        let widthScale = CGFloat(extent.x / Float(distance) * 0.4)
-        let heightScale = CGFloat(extent.z / Float(distance) * 0.4)
+        let extent = anchor.planeExtent
+        let widthScale = CGFloat(extent.width / Float(distance) * 0.4)
+        let heightScale = CGFloat(extent.height / Float(distance) * 0.4)
         
         let width = min(0.5, max(0.1, widthScale))
         let height = min(0.6, max(0.15, heightScale))
@@ -567,10 +613,8 @@ final class ARCameraService: NSObject, ObservableObject {
                 let distanceToGap = simd_length(gapCenter - cameraPosition)
                 guard distanceToGap > 0.5 && distanceToGap < 5.0 else { continue }
                 
-                // Check if both planes are tall enough for a doorway
-                // Using deprecated extent API - still works in iOS 16+
-                let height1 = plane1.extent.z
-                let height2 = plane2.extent.z
+                let height1 = plane1.planeExtent.height
+                let height2 = plane2.planeExtent.height
                 guard height1 >= minDoorwayHeight && height2 >= minDoorwayHeight else { continue }
                 
                 // Check vertical position - doorways should be at ground level
@@ -645,8 +689,8 @@ final class ARCameraService: NSObject, ObservableObject {
                 guard distanceToGap > 0.5 && distanceToGap < 5.0 else { continue }
                 
                 // Check height range (windows are typically smaller than doorways)
-                let height1 = plane1.extent.z
-                let height2 = plane2.extent.z
+                let height1 = plane1.planeExtent.height
+                let height2 = plane2.planeExtent.height
                 let avgHeight = (height1 + height2) / 2.0
                 guard avgHeight >= minWindowHeight && avgHeight <= maxWindowHeight else { continue }
                 
@@ -764,8 +808,10 @@ extension ARCameraService: ARSessionDelegate {
         
         // Extract pixel buffer for YOLO detection (CVPixelBuffer is retained separately)
         let pixelBuffer = frame.capturedImage
+        updateCameraMotion(with: frame)
         DispatchQueue.main.async { [weak self] in
             self?.latestBuffer = pixelBuffer
+            self?.isCameraReady = true
         }
         
         // Extract camera transform data (copy values, not reference)
@@ -787,6 +833,14 @@ extension ARCameraService: ARSessionDelegate {
             projectionMatrix: cameraProjection,
             intrinsics: cameraIntrinsics
         )
+
+        if Date().timeIntervalSince(lastObstacleUpdate) >= 0.5 {
+            lastObstacleUpdate = Date()
+            updateMeshObstacle(using: frame, cameraTransform: cameraTransform, cameraPosition: cameraPosition)
+        }
+
+        guard Date().timeIntervalSince(lastPlaneDetectionUpdate) >= 0.3 else { return }
+        lastPlaneDetectionUpdate = Date()
         
         // Process wall detections on background queue
         // Use extracted data instead of frame to avoid retention
@@ -816,11 +870,8 @@ extension ARCameraService: ARSessionDelegate {
                 // Update timestamp for processed planes
                 self.lastPlaneUpdate[id] = Date()
                 
-                // Only process planes that are large enough (at least 0.5m x 0.5m)
-                // extent is deprecated in iOS 16+ but still available
-                // Using deprecated API as ARPlaneGeometry doesn't expose extent property
-                let extent = anchor.extent
-                guard extent.x > 0.5 && extent.z > 0.5 else { continue }
+                let extent = anchor.planeExtent
+                guard extent.width > 0.5 && extent.height > 0.5 else { continue }
                 
                 // Use extracted frame data instead of frame object
                 if let detection = self.planeToDetection(anchor, 
@@ -848,6 +899,40 @@ extension ARCameraService: ARSessionDelegate {
         }
         
         // Frame is now released - all data has been extracted
+    }
+
+    private func updateMeshObstacle(using frame: ARFrame,
+                                    cameraTransform: simd_float4x4,
+                                    cameraPosition: simd_float3) {
+        let obstacle = detectNearestMeshObstacle(
+            frame: frame,
+            cameraTransform: cameraTransform,
+            cameraPosition: cameraPosition
+        )
+        DispatchQueue.main.async { [weak self] in
+            self?.obstacles3D = obstacle.map { [$0] } ?? []
+        }
+    }
+
+    private func updateCameraMotion(with frame: ARFrame) {
+        let now = Date()
+        cameraMotionSamples.append((now, frame.camera.transform))
+        cameraMotionSamples.removeAll { now.timeIntervalSince($0.date) > 0.5 }
+        guard let first = cameraMotionSamples.first, let last = cameraMotionSamples.last,
+              now.timeIntervalSince(first.date) >= 0.4 else {
+            DispatchQueue.main.async { self.isCameraStable = false }
+            return
+        }
+        let firstPosition = simd_float3(first.transform.columns.3.x, first.transform.columns.3.y, first.transform.columns.3.z)
+        let lastPosition = simd_float3(last.transform.columns.3.x, last.transform.columns.3.y, last.transform.columns.3.z)
+        let translation = simd_distance(firstPosition, lastPosition)
+        let relative = simd_mul(first.transform.inverse, last.transform)
+        let trace = relative.columns.0.x + relative.columns.1.y + relative.columns.2.z
+        let rotation = acos(max(-1, min(1, (trace - 1) / 2)))
+        let trackingNormal: Bool
+        if case .normal = frame.camera.trackingState { trackingNormal = true } else { trackingNormal = false }
+        let stable = trackingNormal && translation < 0.04 && rotation < (.pi * 4 / 180)
+        DispatchQueue.main.async { self.isCameraStable = stable }
     }
     
     func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
