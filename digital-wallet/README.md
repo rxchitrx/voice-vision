@@ -112,10 +112,12 @@ The application will open in your browser at `http://localhost:3000`
 - `POST /api/send-money` - Send money to trusted merchant with idempotency
   - Body: `{ amount, merchantId, idempotencyKey, authMethod?, description? }`
 - `GET /api/transactions` - Get all transactions
-- `POST /api/perception/analyze` - MiniCPM proxy/fallback perception endpoint
+- `POST /api/perception/analyze` - MiniCPM compatibility/fallback perception endpoint
   - Body: `{ mode: "scene"|"read"|"document", prompt?, ocrText?, imageBase64? }`
 
 ### LM Studio Wiring (MiniCPM)
+
+The iOS app now prefers on-device MiniCPM execution. This backend route remains available as a fallback/debug path when the device does not have a working local model runtime.
 
 1. In LM Studio, start Local Server (OpenAI-compatible).
 2. Load a MiniCPM vision model (for example MiniCPM-V-4 GGUF).
@@ -123,7 +125,7 @@ The application will open in your browser at `http://localhost:3000`
    - `MINICPM_API_URL=http://127.0.0.1:1234/v1/chat/completions`
    - `MINICPM_PROVIDER=lmstudio`
    - `MINICPM_MODEL=<your-lmstudio-model-id>`
-4. Restart backend. iOS will call `/api/perception/analyze` and the backend will map requests to LM Studio chat format automatically.
+4. Restart backend. When the device falls back to `/api/perception/analyze`, the backend will map requests to LM Studio chat format automatically.
 
 ## Project Structure
 
@@ -192,7 +194,7 @@ The iOS app uses these endpoints:
 - `GET /api/balance` - Check current balance
 - `GET /api/payment-config` - Load trusted merchant config + QR fingerprint
 - `POST /api/send-money` - Send money (strict merchant + idempotency)
-- `POST /api/perception/analyze` - MiniCPM scene/read/document analysis
+- `POST /api/perception/analyze` - MiniCPM fallback scene/read/document analysis
 
 For more details, see the [Blind Navigation README](../blind-navigation/README.md)
 

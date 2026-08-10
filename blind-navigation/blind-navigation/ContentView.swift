@@ -229,6 +229,50 @@ struct ContentView: View {
                         .background(Color.black.opacity(0.6))
                         .cornerRadius(8)
                 }
+
+                Text("MiniCPM: \(miniCPMService.activeRuntime.displayName)")
+                    .font(.caption2)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(Color.black.opacity(0.6))
+                    .cornerRadius(8)
+
+                Text(miniCPMService.runtimeStatus)
+                    .font(.caption2)
+                    .foregroundColor(.gray)
+                    .lineLimit(3)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(Color.black.opacity(0.6))
+                    .cornerRadius(8)
+
+                if miniCPMService.isInstallingModel {
+                    VStack(alignment: .trailing, spacing: 6) {
+                        Text(miniCPMService.modelInstallStatus ?? "Installing MiniCPM...")
+                            .font(.caption2)
+                            .foregroundColor(.white)
+                            .lineLimit(2)
+                        ProgressView(value: miniCPMService.modelInstallProgress)
+                            .progressViewStyle(.linear)
+                            .frame(width: 160)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(Color.black.opacity(0.6))
+                    .cornerRadius(8)
+                } else if miniCPMService.shouldOfferModelInstall {
+                    Button(action: { miniCPMService.installPreferredLocalModel() }) {
+                        Text("Install MiniCPM")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(Color.blue.opacity(0.75))
+                            .cornerRadius(8)
+                    }
+                    .buttonStyle(.plain)
+                }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
             .padding([.top, .trailing], 12)
@@ -442,7 +486,7 @@ struct ContentView: View {
                     pixelBuffer: buffer,
                     mode: miniCPMMode,
                     ocrText: textRecognition.fullTextContent,
-                    prompt: miniCPMPromptForMode(miniCPMMode)
+                    prompt: MiniCPMPromptBuilder.prompt(for: miniCPMMode)
                 )
             }
             // Always process currency recognition (it checks isActive internally)
@@ -514,6 +558,7 @@ struct ContentView: View {
         .onAppear {
             print("DEBUG: ========== ContentView appeared - starting services... ==========")
             loadPaymentConfiguration()
+            miniCPMService.refreshEngineSelection()
             
             // Check for basic requirements first
             guard ARWorldTrackingConfiguration.isSupported else {
@@ -1206,14 +1251,7 @@ struct ContentView: View {
     }
 
     private func miniCPMPromptForMode(_ mode: MiniCPMMode) -> String {
-        switch mode {
-        case .scene:
-            return "Briefly describe the most important navigation-relevant scene details for a blind user."
-        case .read:
-            return "Read and explain the most relevant visible text clearly and briefly."
-        case .document:
-            return "Parse visible document text into concise key fields and summarize."
-        }
+        MiniCPMPromptBuilder.prompt(for: mode)
     }
 
     private func handleMiniCPMSummary(_ summary: String, mode: MiniCPMMode) {

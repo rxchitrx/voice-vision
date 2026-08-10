@@ -421,11 +421,11 @@ When `POST /api/send-money` is called, the backend:
 
 ## Perception Proxy Design
 
-The project includes a backend perception endpoint so the iOS app does not need to call MiniCPM directly.
+The project includes a backend perception endpoint as a compatibility fallback when the iOS app cannot execute MiniCPM on-device.
 
 Benefits:
 
-- single backend-controlled integration point
+- compatibility/debug fallback for devices without a local runtime
 - easier environment configuration
 - fallback behavior when the model endpoint is unavailable
 - support for scene mode, read mode, and document mode

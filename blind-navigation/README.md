@@ -8,7 +8,7 @@ An iOS accessibility application designed to assist visually impaired users thro
 
 - **Real-time Object Detection**: Uses AI to identify and announce objects in the user's environment
 - **Text Recognition**: Extracts and reads text from images using OCR
-- **MiniCPM Understanding Layer**: Scene explanation and document parsing via backend proxy
+- **MiniCPM Understanding Layer**: Scene explanation and document parsing with on-device-first inference and backend fallback
 - **Currency Recognition**: Specifically designed to recognize and identify Indian currency (Rupees)
 - **QR Code Scanning**: Scan and read QR codes for various purposes
 - **Voice Announcements**: Provides audio feedback for all detected objects and information

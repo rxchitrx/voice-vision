@@ -424,7 +424,7 @@ router.post('/send-money', async (req, res) => {
   }
 });
 
-// MiniCPM proxy endpoint for scene understanding and OCR/document reasoning.
+// MiniCPM proxy endpoint retained as a compatibility/debug fallback when on-device inference is unavailable.
 router.post('/perception/analyze', async (req, res) => {
   try {
     const { mode = 'scene', prompt = '', ocrText = '', imageBase64 = '' } = req.body || {};
